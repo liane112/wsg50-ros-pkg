@@ -1,18 +1,18 @@
 <launch>
-  <arg name="com_mode" default="script" /><!-- or auto_update, polling -->
+  <arg name="com_mode" default="auto_update" /><!-- or auto_update, polling -->
   <arg name="remap" default="false" /><!-- Remap joint_states topic. e.g. for joint_state_publisher -->
   <arg name="force" default="10" />
 
   <remap from="/joint_states" to="/joint_states_gripper" if="$(arg remap)"/>
   
-  <node  name="wsg_50_driver"  pkg="wsg_50_driver" type="wsg_50_ip" output="screen" launch-prefix="gdb --args">
-	  <param name="ip" type="string" value="192.168.20.2"/>
+  <node  name="wsg_50_driver"  pkg="wsg_50_driver" type="wsg_50_ip" output="screen" >
+	  <param name="ip" type="string" value="192.168.1.20"/>
 	  <param name="port" type="int" value="1500"/>
-	  <param name="local_port" type="int" value="5501"/>
+	  <param name="local_port" type="int" value="1500"/>
     <param name="protocol" type="string" value="udp"/>
     <param name="com_mode" type="string" value="$(arg com_mode)"/>
     <param name="rate" type="double" value="50"/>
-    <param name="grasping_force" type="double" value="$(arg force)"/>
+    <param name="grasping_force" type="double" value="0.0"/>
   </node>
 
 </launch>
