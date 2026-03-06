@@ -5,10 +5,11 @@ from std_msgs.msg import Float32
 
 def main():
     rospy.init_node("force_ramp_pub")
-    topic   = rospy.get_param("~topic", "/znsv6_control")
+    topic   = rospy.get_param("~topic", "/znsv6_cmd/act1")
     rate_hz = float(rospy.get_param("~rate_hz", 30.0))
-    slope   = float(rospy.get_param("~slope_N_per_s", 0.5))   # 斜坡速度 N/s
+    slope   = float(rospy.get_param("~slope_N_per_s", 0.1))   # 斜坡速度 N/s
     peak    = float(rospy.get_param("~peak_N", 5.0))          # 峰值 N
+    start   = float(rospy.get_param("~start_N", 0.5))         # 起始值 N（默认从 0.5N 开始）
     loop    = bool(rospy.get_param("~loop", False))           # 是否循环 0→peak→0→...
     hold_s  = float(rospy.get_param("~hold_s", 5.0))          # [MOD] 峰值保持时长（秒），默认 5s
 
@@ -16,7 +17,7 @@ def main():
     r = rospy.Rate(rate_hz)
 
     dt  = 1.0 / rate_hz
-    val = 0.0
+    val = max(0.0, min(float(start), float(peak)))
     dirn = +1.0   # +1 上升，-1 下降
     state = "up"  # [MOD] 三状态：'up' → 'hold' → 'down'
     hold_t = 0.0  # [MOD] 已保持时间累计
@@ -57,4 +58,3 @@ if __name__ == "__main__":
         main()
     except rospy.ROSInterruptException:
         pass
-

@@ -18,7 +18,6 @@ import rospy
 from rospy import AnyMsg
 from roslib.message import get_message_class
 from wsg_50_common.msg import Cmd, Status
-from std_msgs.msg import String
 # [MOD] 绘图依赖（无显示环境用 Agg）
 try:
     import matplotlib
@@ -57,11 +56,6 @@ class WSG50FSM(object):
         self.target_force_index    = int(rospy.get_param("~target_force_index",   0))
         self.force_threshold_N     = float(rospy.get_param("~force_threshold_N",  0.1))  # 单阈值，双向判定
 
-        # 力信号预处理：缩放 + 负数归零 + 低通滤波（EMA）
-        self.measured_scale         = float(rospy.get_param("~measured_scale", 1.0))
-        self.force_lpf_alpha        = float(rospy.get_param("~force_lpf_alpha", 0.3))
-        self.target_force_lpf_alpha = float(rospy.get_param("~target_force_lpf_alpha", self.force_lpf_alpha))
-
         self.approach_speed_mm_s   = float(rospy.get_param("~approach_speed_mm_s", 10.0))
         self.pid_speed_mm_s        = float(rospy.get_param("~pid_speed_mm_s",      10.0))
         self.start_width_mm        = float(rospy.get_param("~start_width_mm",     110.0))
@@ -92,15 +86,6 @@ class WSG50FSM(object):
         # ---------- 目标带死区 ----------
         self.target_deadband_N = float(rospy.get_param("~target_deadband_N", 0.1))
 
-        # FORCE -> OPEN_TO_START：张开回初始位置（用未滤波 raw 触发）
-        self.open_on_threshold_N  = float(rospy.get_param("~open_on_threshold_N", 0.4))
-        self.open_off_threshold_N = float(rospy.get_param("~open_off_threshold_N", 0.75))
-        open_trigger_mode = str(rospy.get_param("~open_trigger_mode", "both")).strip().lower()
-        if open_trigger_mode not in ("both", "target_only"):
-            rospy.logwarn("Unknown open_trigger_mode=%r, using 'both'", open_trigger_mode)
-            open_trigger_mode = "both"
-        self.open_trigger_require_measured = (open_trigger_mode == "both")
-
         # ---------- 新增：性能指标参数 ----------
         self.rise_frac = float(rospy.get_param("~rise_frac", 0.9))               # 上升百分比（默认 90%）
         self.settle_band_frac = float(rospy.get_param("~settle_band_frac", 0.1)) # 调整带宽（默认 ±10%）
@@ -108,20 +93,11 @@ class WSG50FSM(object):
         self.target_scale = float(rospy.get_param("~target_scale", 1.15))
 
         # ---- 运行时变量 ----
-        self.state   = "INIT"                       # INIT / APPROACH / FORCE / OPEN_TO_START
+        self.state   = "INIT"                       # INIT / APPROACH / FORCE
         self.prev_state = None
 
         self.width_mm = None
         self.pos_cmd  = None
-
-        # raw / filtered forces (N)
-        # - measured: scaled, then negative->0, then filter
-        # - target  : abs, then filter; scaling仍在控制里统一乘 target_scale
-        self.target_force_raw = None   # abs(target)（未滤波，OPEN_TO_START 触发用；按原话题值比较）
-        self.target_force_f   = None   # abs(target) 低通后（未缩放）
-        self.meas_force_raw   = None   # measured_scale 后、负数归零（未滤波，OPEN_TO_START 触发用）
-        self.meas_force_f     = None   # measured_scale 后、负数归零 + 低通后
-
         self.target_force = None
         self.meas_force   = None
 
@@ -140,10 +116,6 @@ class WSG50FSM(object):
 
         # ---- ROS 通信 ----
         self.pub_cmd = rospy.Publisher(self.goal_position_topic, Cmd, queue_size=10)
-        self.debug_topic = rospy.get_param("~debug_topic", "debug")
-        self.debug_period_s = float(rospy.get_param("~debug_period_s", 0.2))
-        self.pub_debug = rospy.Publisher(self.debug_topic, String, queue_size=10)
-        self._last_debug_t = rospy.Time(0)
         rospy.Subscriber(self.status_topic,         Status,  self._status_cb,  queue_size=20)
         rospy.Subscriber(self.measured_force_topic, AnyMsg,  self._meas_cb,    queue_size=50)
         rospy.Subscriber(self.target_force_topic,   AnyMsg,  self._target_cb,  queue_size=20)
@@ -171,20 +143,7 @@ class WSG50FSM(object):
                 self._meas_cls = get_message_class(typ)
             m = self._meas_cls(); m.deserialize(any_msg._buff)
             v = extract_scalar_from_msg(m, self.measured_force_index)
-            if v is None:
-                return
-
-            f = float(v) * self.measured_scale
-            f = max(0.0, f)  # 负数归零（替代 abs）
-            self.meas_force_raw = f
-
-            if self.meas_force_f is None:
-                self.meas_force_f = f
-            else:
-                a = clamp(self.force_lpf_alpha, 0.0, 1.0)
-                self.meas_force_f = a * f + (1.0 - a) * self.meas_force_f
-
-            self.meas_force = self.meas_force_f
+            if v is not None: self.meas_force = float(v)
         except Exception as e:
             rospy.logwarn_throttle(2.0, "measured_force parse failed: %s", e)
 
@@ -195,19 +154,7 @@ class WSG50FSM(object):
                 self._tgt_cls = get_message_class(typ)
             m = self._tgt_cls(); m.deserialize(any_msg._buff)
             v = extract_scalar_from_msg(m, self.target_force_index)
-            if v is None:
-                return
-
-            t = abs(float(v))  # 目标力取正（按原话题值）
-            self.target_force_raw = t
-
-            if self.target_force_f is None:
-                self.target_force_f = t
-            else:
-                a = clamp(self.target_force_lpf_alpha, 0.0, 1.0)
-                self.target_force_f = a * t + (1.0 - a) * self.target_force_f
-
-            self.target_force = self.target_force_f
+            if v is not None: self.target_force = float(v)
         except Exception as e:
             rospy.logwarn_throttle(2.0, "target_force parse failed: %s", e)
 
@@ -257,11 +204,6 @@ class WSG50FSM(object):
                 self._rise_time_s = None
                 self._settle_time_s = None
                 rospy.loginfo("Enter FORCE.")
-            elif self.state == "OPEN_TO_START":
-                self.int_acc = 0.0
-                self.prev_err = None
-                self.pos_cmd = None
-                rospy.loginfo("Enter OPEN_TO_START (open to start width and hold).")
             self.prev_state = self.state
 
         # 状态逻辑
@@ -281,16 +223,6 @@ class WSG50FSM(object):
                 self.state = "FORCE"
 
         elif self.state == "FORCE":
-            # 优先检查：目标力/实测力（raw）很小 -> 张开回初始位置并保持
-            if self.target_force_raw is not None and self.target_force_raw <= self.open_on_threshold_N and \
-               ((not self.open_trigger_require_measured) or (self.meas_force_raw is not None and self.meas_force_raw <= self.open_on_threshold_N)):
-                self.state = "OPEN_TO_START"
-                # 让进入 OPEN_TO_START 的第一条开夹爪命令不被最小周期挡住
-                self._last_send_t = rospy.Time(0)
-                self._last_send_w = None
-                self._last_send_v = None
-                return
-
             if (self.meas_force is None) or (self.meas_force < self.force_threshold_N):
                 self.state = "APPROACH"
                 return
@@ -298,9 +230,9 @@ class WSG50FSM(object):
             if self.target_force is None or self.width_mm is None:
                 return
 
-            # 控制用目标力：回调中已 abs + 滤波；这里做缩放与死区
-            raw_target = self.target_force_raw if self.target_force_raw is not None else float("nan")
-            scaled_target = self.target_scale * self.target_force
+            # 控制用目标力：原始目标 * target_scale，再应用死区
+            raw_target = self.target_force
+            scaled_target = self.target_scale * raw_target
             tgt = 0.0 if abs(scaled_target) <= self.target_deadband_N else scaled_target
             # PID（误差: 缩放后目标力 - 实测力）
             err = tgt - self.meas_force
@@ -324,32 +256,8 @@ class WSG50FSM(object):
             # ---- 新增：FORCE 期间记录（相对 FORCE 起点时间）----
             if self._t_force_start is not None and self.meas_force is not None:
                 t_rel = (rospy.Time.now() - self._t_force_start).to_sec()
-                # 日志：meas 为滤波后（非负），tgt 记录进入控制的目标幅值
-                self._force_log.append((t_rel, float(self.meas_force), abs(float(tgt))))
-
-        elif self.state == "OPEN_TO_START":
-            # 张开到初始位置并保持，等待目标力恢复
-            self._send_goal(self.start_width_mm, self.approach_speed_mm_s)
-            if self.target_force_raw is not None and self.target_force_raw >= self.open_off_threshold_N:
-                self.state = "APPROACH"
-
-        # 周期输出调试信息（当前状态/力）
-        now = rospy.Time.now()
-        if self.debug_period_s > 0.0 and (now - self._last_debug_t).to_sec() >= self.debug_period_s:
-            meas_f = self.meas_force_f
-            meas_raw = self.meas_force_raw
-            tgt_f = self.target_force_f
-            tgt_raw = self.target_force_raw
-            self.pub_debug.publish(String(
-                data=(
-                    f"state={self.state} "
-                    f"meas_raw={meas_raw if meas_raw is not None else 'nan'} "
-                    f"meas_f={meas_f if meas_f is not None else 'nan'} "
-                    f"target_raw={tgt_raw if tgt_raw is not None else 'nan'} "
-                    f"target_f={tgt_f if tgt_f is not None else 'nan'}"
-                )
-            ))
-            self._last_debug_t = now
+                # 日志中保留原始目标力（绝对值），显示/指标用原始值
+                self._force_log.append( (t_rel, abs(self.meas_force), abs(raw_target)) )
 
     # ===== 退出时计算上升时间 / 调整时间 =====
     def _on_shutdown(self):
