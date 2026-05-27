@@ -157,6 +157,7 @@ class WSG50FSM(object):
         # [MOD] 保存曲线图的开关与路径（不传也能跑）
         self.save_plot = rospy.get_param("~save_plot", True)          # True=退出时保存曲线图
         self.plot_path = rospy.get_param("~plot_path", "")            # 为空则自动生成文件名到当前目录
+        self.model_name = rospy.get_param("~model_name", rospy.get_param("/tac_policy_model_name", ""))
 
         rospy.loginfo("FSM ready. Press 's' + Enter to start APPROACH.")
 
@@ -457,6 +458,9 @@ class WSG50FSM(object):
                     # plt.axhline(y=Yss*(1+self.settle_band_frac), color='red', linestyle='-.', label='Settle Band Upper')
                     # plt.axhline(y=Yss*(1-self.settle_band_frac), color='red', linestyle='-.', label='Settle Band Lower')
                     plt.title("WSG-50 FORCE Control Performance")
+                    model_name = self.model_name or rospy.get_param("/tac_policy_model_name", "")
+                    if model_name:
+                        plt.gcf().text(0.01, 0.01, "Model: {}".format(model_name), fontsize=8, ha="left", va="bottom")
                     plt.xlabel("Time (s)")
                     plt.ylabel("Force (N)")
                     plt.legend()
