@@ -28,7 +28,7 @@ class Phase1CloseTest(object):
         # 参数
         self.goal_position_topic = rospy.get_param("~goal_position_topic", "/wsg_50_driver/goal_position")
         self.status_topic        = rospy.get_param("~status_topic",        "/wsg_50_driver/status")
-        self.force_topic         = rospy.get_param("~force_topic",         "/znsv6_data_sensor1")
+        self.force_topic         = rospy.get_param("~force_topic",         "/znsv6_data_sensor2")
 
         self.force_index     = int(rospy.get_param("~force_index", 0))
         self.stop_force_N    = float(rospy.get_param("~stop_force_N", 0.1))
@@ -153,4 +153,3 @@ if __name__ == "__main__":
         Phase1CloseTest().run()
     except rospy.ROSInterruptException:
         pass
-

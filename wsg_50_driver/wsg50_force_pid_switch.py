@@ -54,8 +54,8 @@ class WSG50ForcePIDSwitchSM(object):
         self.goal_position_topic = rospy.get_param("~goal_position_topic", "/wsg_50_driver/goal_position")
         self.status_topic        = rospy.get_param("~status_topic",        "/wsg_50_driver/status")
 
-        self.target_force_topic   = rospy.get_param("~target_force_topic",   "/znsv6_control")
-        self.measured_force_topic = rospy.get_param("~measured_force_topic", "/znsv6_data_sensor1")
+        self.target_force_topic   = rospy.get_param("~target_force_topic",   "/znsv6_cmd/act2")
+        self.measured_force_topic = rospy.get_param("~measured_force_topic", "/znsv6_data_sensor2")
         self.target_index   = int(rospy.get_param("~target_force_index", 0))
         self.measured_index = int(rospy.get_param("~measured_force_index", 0))
         self.target_scale   = float(rospy.get_param("~target_force_scale", 1.0))

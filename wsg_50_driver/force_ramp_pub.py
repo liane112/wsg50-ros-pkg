@@ -5,7 +5,7 @@ from std_msgs.msg import Float32
 
 def main():
     rospy.init_node("force_ramp_pub")
-    topic   = rospy.get_param("~topic", "/znsv6_cmd/act1")
+    topic   = rospy.get_param("~topic", "/znsv6_cmd/act2")
     rate_hz = float(rospy.get_param("~rate_hz", 30.0))
     slope   = float(rospy.get_param("~slope_N_per_s", 0.1))   # 斜坡速度 N/s
     peak    = float(rospy.get_param("~peak_N", 5.0))          # 峰值 N

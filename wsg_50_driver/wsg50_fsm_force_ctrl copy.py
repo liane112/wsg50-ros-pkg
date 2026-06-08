@@ -9,8 +9,8 @@ WSG-50 三态有限状态机（INIT / APPROACH / FORCE）
 - 订阅/发布话题沿用之前：
   * pub  : /wsg_50_driver/goal_position (wsg_50_common/Cmd)
   * sub  : /wsg_50_driver/status (wsg_50_common/Status: width[mm])  
-  * sub  : /znsv6_data_sensor1      (实测力：支持 *WithHeader/Float32/Float64/MultiArray)
-  * sub  : /znsv6_control           (目标力：同上)  改为/znsv6_cmd/act1
+  * sub  : /znsv6_data_sensor2      (实测力：支持 *WithHeader/Float32/Float64/MultiArray)
+  * sub  : /znsv6_cmd/act2          (目标力：同上)
 """
 
 import sys, select, threading, time
@@ -48,8 +48,8 @@ class WSG50FSM(object):
         # ---- 话题名（与之前一致，可用 _xxx:= 重映射）----
         self.goal_position_topic   = rospy.get_param("~goal_position_topic", "/wsg_50_driver/goal_position")
         self.status_topic          = rospy.get_param("~status_topic",        "/wsg_50_driver/status")
-        self.measured_force_topic  = rospy.get_param("~measured_force_topic","/znsv6_data_sensor1")
-        self.target_force_topic    = rospy.get_param("~target_force_topic",  "/znsv6_cmd/act1")
+        self.measured_force_topic  = rospy.get_param("~measured_force_topic","/znsv6_data_sensor2")
+        self.target_force_topic    = rospy.get_param("~target_force_topic",  "/znsv6_cmd/act2")
 
         # ---- 参数（仅必要的）----
         self.measured_force_index  = int(rospy.get_param("~measured_force_index", 0))

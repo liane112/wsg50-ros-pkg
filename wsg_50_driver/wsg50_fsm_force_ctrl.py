@@ -8,17 +8,19 @@ WSG-50 三态有限状态机（INIT / APPROACH / FORCE）
 - 频率固定 30 Hz
 - 订阅/发布话题沿用之前：
   * pub  : /wsg_50_driver/goal_position (wsg_50_common/Cmd)
+  * pub  : ~/measured_force_filtered, ~/target_force_filtered (std_msgs/Float32)
   * sub  : /wsg_50_driver/status (wsg_50_common/Status: width[mm])  
-  * sub  : /znsv6_data_sensor1      (实测力：支持 *WithHeader/Float32/Float64/MultiArray)
-  * sub  : /znsv6_control           (目标力：同上)  改为/znsv6_cmd/act1
+  * sub  : /znsv6_data_sensor2      (实测力：支持 *WithHeader/Float32/Float64/MultiArray)
+  * sub  : /znsv6_cmd/act2          (目标力：同上)
 """
 
 import sys, select, threading, time
+import csv
 import rospy
 from rospy import AnyMsg
 from roslib.message import get_message_class
 from wsg_50_common.msg import Cmd, Status
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32
 # [MOD] 绘图依赖（无显示环境用 Agg）
 try:
     import matplotlib
@@ -49,18 +51,19 @@ class WSG50FSM(object):
         # ---- 话题名（与之前一致，可用 _xxx:= 重映射）----
         self.goal_position_topic   = rospy.get_param("~goal_position_topic", "/wsg_50_driver/goal_position")
         self.status_topic          = rospy.get_param("~status_topic",        "/wsg_50_driver/status")
-        self.measured_force_topic  = rospy.get_param("~measured_force_topic","/znsv6_data_sensor1")
-        self.target_force_topic    = rospy.get_param("~target_force_topic",  "/znsv6_cmd/act1")
+        self.measured_force_topic  = rospy.get_param("~measured_force_topic","/znsv6_data_sensor2")
+        self.target_force_topic    = rospy.get_param("~target_force_topic",  "/znsv6_cmd/act2")
 
         # ---- 参数（仅必要的）----
         self.measured_force_index  = int(rospy.get_param("~measured_force_index", 0))
         self.target_force_index    = int(rospy.get_param("~target_force_index",   0))
-        self.force_threshold_N     = float(rospy.get_param("~force_threshold_N",  0.1))  # 单阈值，双向判定
+        self.force_threshold_N     = float(rospy.get_param("~force_threshold_N",  0.15))  # 单阈值，双向判定
 
         # 力信号预处理：缩放 + 负数归零 + 低通滤波（EMA）
         self.measured_scale         = float(rospy.get_param("~measured_scale", 1.0))
         self.force_lpf_alpha        = float(rospy.get_param("~force_lpf_alpha", 0.3))
         self.target_force_lpf_alpha = float(rospy.get_param("~target_force_lpf_alpha", self.force_lpf_alpha))
+        self.target_timeout_s       = float(rospy.get_param("~target_timeout_s", 1.0))
 
         self.approach_speed_mm_s   = float(rospy.get_param("~approach_speed_mm_s", 10.0))
         self.pid_speed_mm_s        = float(rospy.get_param("~pid_speed_mm_s",      10.0))
@@ -127,6 +130,7 @@ class WSG50FSM(object):
 
         self._meas_cls = None
         self._tgt_cls  = None
+        self.last_target_rx_t = None
 
         # PID 内部
         self.int_acc = 0.0
@@ -134,15 +138,24 @@ class WSG50FSM(object):
 
         # ---------- 新增：FORCE 期间的数据记录 ----------
         self._t_force_start = None
-        self._force_log = []      # [(t_rel, |meas|, |tgt|), ...]
+        self._force_log = []      # [{ros_time_s, t_rel_s, measured_filtered_N, target_ctrl_N, ...}, ...]
         self._rise_time_s = None
         self._settle_time_s = None
+        self._csv_saved = False
 
         # ---- ROS 通信 ----
         self.pub_cmd = rospy.Publisher(self.goal_position_topic, Cmd, queue_size=10)
         self.debug_topic = rospy.get_param("~debug_topic", "debug")
         self.debug_period_s = float(rospy.get_param("~debug_period_s", 0.2))
         self.pub_debug = rospy.Publisher(self.debug_topic, String, queue_size=10)
+        self.filtered_measured_force_topic = rospy.get_param(
+            "~filtered_measured_force_topic", "~measured_force_filtered")
+        self.filtered_target_force_topic = rospy.get_param(
+            "~filtered_target_force_topic", "~target_force_filtered")
+        self.pub_meas_force_filtered = rospy.Publisher(
+            self.filtered_measured_force_topic, Float32, queue_size=10)
+        self.pub_target_force_filtered = rospy.Publisher(
+            self.filtered_target_force_topic, Float32, queue_size=10)
         self._last_debug_t = rospy.Time(0)
         rospy.Subscriber(self.status_topic,         Status,  self._status_cb,  queue_size=20)
         rospy.Subscriber(self.measured_force_topic, AnyMsg,  self._meas_cb,    queue_size=50)
@@ -155,8 +168,10 @@ class WSG50FSM(object):
         # ---------- 新增：退出时计算指标 ----------
         rospy.on_shutdown(self._on_shutdown)
         # [MOD] 保存曲线图的开关与路径（不传也能跑）
-        self.save_plot = rospy.get_param("~save_plot", True)          # True=退出时保存曲线图
+        self.save_plot = rospy.get_param("~save_plot", False)         # True=退出时保存曲线图
         self.plot_path = rospy.get_param("~plot_path", "")            # 为空则自动生成文件名到当前目录
+        self.save_csv = rospy.get_param("~save_csv", True)            # True=退出时保存 FORCE 阶段 CSV
+        self.csv_path = rospy.get_param("~csv_path", "")              # 为空则自动生成带时间戳文件名到当前目录
         self.model_name = rospy.get_param("~model_name", rospy.get_param("/tac_policy_model_name", ""))
 
         rospy.loginfo("FSM ready. Press 's' + Enter to start APPROACH.")
@@ -186,6 +201,7 @@ class WSG50FSM(object):
                 self.meas_force_f = a * f + (1.0 - a) * self.meas_force_f
 
             self.meas_force = self.meas_force_f
+            self.pub_meas_force_filtered.publish(Float32(data=float(self.meas_force)))
         except Exception as e:
             rospy.logwarn_throttle(2.0, "measured_force parse failed: %s", e)
 
@@ -198,6 +214,7 @@ class WSG50FSM(object):
             v = extract_scalar_from_msg(m, self.target_force_index)
             if v is None:
                 return
+            self.last_target_rx_t = rospy.Time.now()
 
             t = abs(float(v))  # 目标力取正（按原话题值）
             self.target_force_raw = t
@@ -209,8 +226,31 @@ class WSG50FSM(object):
                 self.target_force_f = a * t + (1.0 - a) * self.target_force_f
 
             self.target_force = self.target_force_f
+            self.pub_target_force_filtered.publish(Float32(data=float(self.target_force)))
         except Exception as e:
             rospy.logwarn_throttle(2.0, "target_force parse failed: %s", e)
+
+    def _check_target_timeout(self):
+        if self.target_timeout_s <= 0.0:
+            return
+        now = rospy.Time.now()
+        if self.last_target_rx_t is None:
+            rospy.logwarn_throttle(
+                1.0,
+                "目标力超时未收到: topic=%s, timeout=%.2fs",
+                self.target_force_topic,
+                self.target_timeout_s,
+            )
+            return
+        age = (now - self.last_target_rx_t).to_sec()
+        if age > self.target_timeout_s:
+            rospy.logwarn_throttle(
+                1.0,
+                "目标力超时未收到: topic=%s, age=%.2fs > %.2fs",
+                self.target_force_topic,
+                age,
+                self.target_timeout_s,
+            )
 
     # ===== 键盘输入：'s' + Enter 进入 APPROACH =====
     def _keyboard_loop(self):
@@ -243,6 +283,8 @@ class WSG50FSM(object):
 
     # ===== 一个 tick（30Hz） =====
     def _tick(self, dt):
+        self._check_target_timeout()
+
         # 进入 APPROACH / FORCE 时的处理
         if self.state != self.prev_state:
             if self.state == "APPROACH":
@@ -324,9 +366,20 @@ class WSG50FSM(object):
 
             # ---- 新增：FORCE 期间记录（相对 FORCE 起点时间）----
             if self._t_force_start is not None and self.meas_force is not None:
-                t_rel = (rospy.Time.now() - self._t_force_start).to_sec()
-                # 日志：meas 为滤波后（非负），tgt 记录进入控制的目标幅值
-                self._force_log.append((t_rel, float(self.meas_force), abs(float(tgt))))
+                now = rospy.Time.now()
+                t_rel = (now - self._t_force_start).to_sec()
+                self._force_log.append({
+                    "ros_time_s": now.to_sec(),
+                    "t_rel_s": t_rel,
+                    "target_raw_N": raw_target,
+                    "target_filtered_N": self.target_force_f if self.target_force_f is not None else float("nan"),
+                    "target_ctrl_N": float(tgt),
+                    "measured_raw_N": self.meas_force_raw if self.meas_force_raw is not None else float("nan"),
+                    "measured_filtered_N": float(self.meas_force),
+                    "error_N": float(err),
+                    "width_mm": self.width_mm if self.width_mm is not None else float("nan"),
+                    "cmd_width_mm": float(new_width),
+                })
 
         elif self.state == "OPEN_TO_START":
             # 张开到初始位置并保持，等待目标力恢复
@@ -352,6 +405,51 @@ class WSG50FSM(object):
             ))
             self._last_debug_t = now
 
+    def _make_timestamped_csv_path(self):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        if not self.csv_path:
+            return os.path.join(os.getcwd(), f"wsg50_force_ctrl_{timestamp}.csv")
+
+        path = os.path.expanduser(str(self.csv_path))
+        if path.endswith(os.sep) or os.path.isdir(path):
+            return os.path.join(path, f"wsg50_force_ctrl_{timestamp}.csv")
+
+        root, ext = os.path.splitext(path)
+        if not ext:
+            return os.path.join(path, f"wsg50_force_ctrl_{timestamp}.csv")
+        if ext.lower() == ".csv":
+            return f"{root}_{timestamp}.csv"
+        return f"{path}_{timestamp}.csv"
+
+    def _save_force_csv(self):
+        if self._csv_saved or not self.save_csv or not self._force_log:
+            return
+
+        path = self._make_timestamped_csv_path()
+        out_dir = os.path.dirname(path)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+
+        fieldnames = [
+            "ros_time_s",
+            "t_rel_s",
+            "target_raw_N",
+            "target_filtered_N",
+            "target_ctrl_N",
+            "measured_raw_N",
+            "measured_filtered_N",
+            "error_N",
+            "width_mm",
+            "cmd_width_mm",
+        ]
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self._force_log)
+
+        self._csv_saved = True
+        rospy.loginfo("Force control CSV saved to: %s", path)
+
     # ===== 退出时计算上升时间 / 调整时间 =====
     def _on_shutdown(self):
         try:
@@ -364,8 +462,12 @@ class WSG50FSM(object):
                 )
                 return
 
+            self._save_force_csv()
+
             # 解包记录：ts[0..N-1], meas_abs[k], tgt_abs[k]
-            ts, meas_abs, tgt_abs = zip(*self._force_log)  # note: keep your original attr name
+            ts = tuple(row["t_rel_s"] for row in self._force_log)
+            meas_abs = tuple(abs(row["measured_filtered_N"]) for row in self._force_log)
+            tgt_abs = tuple(abs(row["target_ctrl_N"]) for row in self._force_log)
             n = len(meas_abs)
 
             # ---- 上升时间：相对稳态值 Yss 的 ~self.rise_frac ----
@@ -373,7 +475,7 @@ class WSG50FSM(object):
             if Yss <= 1e-9:
                 rospy.loginfo(
                     "Steady-state force ~0; cannot compute times. PID[Kp=%.3f, Ki=%.3f, Kd=%.3f]",
-                    getattr(self, "kp", float("n an")), getattr(self, "ki", float("nan")), getattr(self, "kd", float("nan"))
+                    getattr(self, "kp", float("nan")), getattr(self, "ki", float("nan")), getattr(self, "kd", float("nan"))
                 )
                 return
 
