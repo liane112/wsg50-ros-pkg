@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WSG-50 五态有限状态机（INIT / APPROACH / FORCE / OPEN_TO_START / WAIT_REAPPROACH）
+WSG-50 有限状态机（默认五态；可选 v4 接触捕获/预加载管线）
 - 输入 's' + 回车：INIT/WAIT_REAPPROACH -> APPROACH
 - APPROACH：低速按 110→0 方向闭合；若实测力 >= 阈值 -> FORCE
+  或在 _contact_pipeline_enable:=true 时 -> CONTACT_CAPTURE -> PRELOAD -> FORCE
 - FORCE：按目标力做 PID；目标力快速下降或失接触 -> OPEN_TO_START
 - OPEN_TO_START：张开到 start_width_mm；到位或超时 -> WAIT_REAPPROACH
 - WAIT_REAPPROACH：保持张开，等待键盘 's'
@@ -241,6 +242,49 @@ class WSG50FSM(object):
         self.warn_on_low_target_reapproach = bool(rospy.get_param("~warn_on_low_target_reapproach", True))
         self.low_target_reapproach_warn_N = float(rospy.get_param("~low_target_reapproach_warn_N", 0.4))
 
+        # v4: 可选接触捕获/预加载管线。默认关闭，保持 v3 行为。
+        self.contact_pipeline_enable = bool(rospy.get_param("~contact_pipeline_enable", False))
+        self.force_baseline_auto_enable = bool(rospy.get_param("~force_baseline_auto_enable", True))
+        self.force_baseline_window_s = float(rospy.get_param("~force_baseline_window_s", 0.5))
+        self.force_baseline_freeze_on_approach = bool(
+            rospy.get_param("~force_baseline_freeze_on_approach", True))
+        self.force_baseline_N = float(rospy.get_param("~force_baseline_N", 0.0))
+        self.force_baseline_apply_to_control = bool(
+            rospy.get_param("~force_baseline_apply_to_control", True))
+        self.force_enter_confirm_s = float(rospy.get_param("~force_enter_confirm_s", 0.10))
+
+        self.capture_settle_s = float(rospy.get_param("~capture_settle_s", 0.12))
+        self.capture_backoff_enable = bool(rospy.get_param("~capture_backoff_enable", True))
+        self.capture_backoff_mm = float(rospy.get_param("~capture_backoff_mm", 0.20))
+        self.capture_backoff_speed_mm_s = float(rospy.get_param("~capture_backoff_speed_mm_s", 20.0))
+        self.capture_hold_speed_mm_s = float(rospy.get_param("~capture_hold_speed_mm_s", 5.0))
+        self.capture_timeout_s = float(rospy.get_param("~capture_timeout_s", 0.5))
+
+        self.overshoot_recovery_enable = bool(rospy.get_param("~overshoot_recovery_enable", True))
+        self.capture_normal_high_N = float(rospy.get_param("~capture_normal_high_N", 1.2))
+        self.capture_overshoot_check_s = float(rospy.get_param("~capture_overshoot_check_s", 0.50))
+        self.overshoot_k_open_mm_per_N = float(rospy.get_param("~overshoot_k_open_mm_per_N", 0.10))
+        self.overshoot_min_step_mm = float(rospy.get_param("~overshoot_min_step_mm", 0.02))
+        self.overshoot_max_step_mm = float(rospy.get_param("~overshoot_max_step_mm", 0.20))
+        self.overshoot_open_speed_mm_s = float(rospy.get_param("~overshoot_open_speed_mm_s", 20.0))
+        self.overshoot_timeout_s = float(rospy.get_param("~overshoot_timeout_s", 0.8))
+        self.overshoot_recovered_confirm_s = float(rospy.get_param("~overshoot_recovered_confirm_s", 0.10))
+
+        self.preload_target_N = float(rospy.get_param("~preload_target_N", 0.5))
+        self.preload_low_N = float(rospy.get_param("~preload_low_N", 0.25))
+        self.preload_high_N = float(rospy.get_param("~preload_high_N", 0.8))
+        self.preload_kp_mm_per_N = float(rospy.get_param("~preload_kp_mm_per_N", 0.05))
+        self.preload_kd_mm_per_Ns = float(rospy.get_param("~preload_kd_mm_per_Ns", 0.0))
+        self.preload_speed_mm_s = float(rospy.get_param("~preload_speed_mm_s", 5.0))
+        self.preload_min_hold_s = float(rospy.get_param("~preload_min_hold_s", 0.20))
+        self.preload_ready_confirm_s = float(rospy.get_param("~preload_ready_confirm_s", 0.10))
+        self.preload_timeout_s = float(rospy.get_param("~preload_timeout_s", 1.0))
+        self.preload_dforce_max_N_per_s = float(rospy.get_param("~preload_dforce_max_N_per_s", 1.0))
+        self.policy_target_stale_s = float(rospy.get_param("~policy_target_stale_s", 0.30))
+        self.policy_blend_s = float(rospy.get_param("~policy_blend_s", 0.4))
+        self.target_rise_rate_N_per_s = float(rospy.get_param("~target_rise_rate_N_per_s", 2.0))
+        self.target_fall_rate_N_per_s = float(rospy.get_param("~target_fall_rate_N_per_s", 4.0))
+
         # PID（单位：mm/N, mm/(N·s), mm/(N·s)）
         self.kp = float(rospy.get_param("~kp_mm_per_N",   0.15))
         self.ki = float(rospy.get_param("~ki_mm_per_Ns",  0.00))
@@ -251,6 +295,12 @@ class WSG50FSM(object):
         self.max_width_mm   = float(rospy.get_param("~max_width_mm", 110.0))
         self.min_speed_mm_s = float(rospy.get_param("~min_speed_mm_s",  5.0))
         self.max_speed_mm_s = float(rospy.get_param("~max_speed_mm_s", 420.0))
+
+        # 张开限位保护：默认不再反复命令机械满开位置。
+        self.open_limit_protect_enable = bool(rospy.get_param("~open_limit_protect_enable", True))
+        self.open_limit_margin_mm = float(rospy.get_param("~open_limit_margin_mm", 1.0))
+        self.open_stop_when_reached = bool(rospy.get_param("~open_stop_when_reached", True))
+        self.hold_open_stop_when_reached = bool(rospy.get_param("~hold_open_stop_when_reached", True))
 
         # ---------- 发送去抖 & 死区 ----------
         self.pos_eps_mm = float(rospy.get_param("~pos_eps_mm", 0.03))
@@ -329,7 +379,7 @@ class WSG50FSM(object):
 
         # ---- 运行时变量 ----
         self._lock = threading.RLock()
-        self.state   = "INIT"                       # INIT / APPROACH / FORCE / OPEN_TO_START / WAIT_REAPPROACH
+        self.state   = "INIT"                       # INIT / APPROACH / CONTACT_CAPTURE / OVERSHOOT_RECOVERY / PRELOAD / FORCE / OPEN_TO_START / WAIT_REAPPROACH
         self.prev_state = None
 
         self.width_mm = None
@@ -367,6 +417,7 @@ class WSG50FSM(object):
         self.int_acc = 0.0
         self.prev_err = None
         self.prev_pid_time_s = None
+        self.prev_target_ctrl_N = None
 
         trend_cfg = {
             "window_s": self.trend_window_s,
@@ -397,6 +448,9 @@ class WSG50FSM(object):
         self.target_low_timer = HoldTimer()
         self.measured_low_timer = HoldTimer()
         self.contact_lost_timer = HoldTimer()
+        self.contact_enter_timer = HoldTimer()
+        self.preload_ready_timer = HoldTimer()
+        self.overshoot_recovered_timer = HoldTimer()
         self.target_low_now = False
         self.target_low_confirmed = False
         self.measured_low_now = False
@@ -408,6 +462,7 @@ class WSG50FSM(object):
         self.contact_lost_open_triggered = False
 
         self.force_enter_time_s = None
+        self.force_blend_from_preload = False
         self.open_reason = ""
         self.open_enter_time_s = None
         self.wait_reapproach_enter_time_s = None
@@ -417,6 +472,23 @@ class WSG50FSM(object):
         self.last_hold_open_send_s = 0.0
         self.last_cmd_width_mm = None
         self.last_cmd_speed_mm_s = None
+
+        self.force_baseline_samples = deque()
+        self.force_baseline_frozen = False
+        self.meas_force_contact_N = 0.0
+        self.d_contact_force_N_per_s = 0.0
+        self.prev_contact_force_N = None
+        self.prev_contact_force_time_s = None
+        self.contact_capture_enter_time_s = None
+        self.capture_start_width_mm = None
+        self.capture_start_force_N = None
+        self.overshoot_enter_time_s = None
+        self.preload_enter_time_s = None
+        self.initial_overshoot = False
+        self.preload_ready = False
+        self.policy_blend_beta = 1.0
+        self.target_ctrl_after_blend_N = None
+        self.open_target_width_mm = self.start_width_mm
 
         # ---------- 新增：FORCE 期间的数据记录 ----------
         self._t_force_start = None
@@ -638,10 +710,86 @@ class WSG50FSM(object):
         self.int_acc = 0.0
         self.prev_err = None
         self.prev_pid_time_s = None
+        self.prev_target_ctrl_N = None
 
     def _set_state(self, new_state):
         self.prev_state = self.state
         self.state = new_state
+
+    def _update_force_baseline(self, now_s, snapshot):
+        if not self.force_baseline_auto_enable:
+            return
+        if self.force_baseline_frozen:
+            return
+        if self.state not in ("INIT", "WAIT_REAPPROACH"):
+            return
+        if not snapshot["meas_valid"]:
+            return
+
+        self.force_baseline_samples.append((now_s, snapshot["meas_force_f_N"]))
+        while self.force_baseline_samples and \
+              (now_s - self.force_baseline_samples[0][0]) > self.force_baseline_window_s:
+            self.force_baseline_samples.popleft()
+
+        if self.force_baseline_samples:
+            vals = [v for _, v in self.force_baseline_samples]
+            self.force_baseline_N = sum(vals) / len(vals)
+
+    def _update_contact_measurement(self, now_s, snapshot):
+        if snapshot["meas_force_f_N"] is None:
+            self.meas_force_contact_N = 0.0
+            self.d_contact_force_N_per_s = 0.0
+            return
+
+        if self.contact_pipeline_enable and self.force_baseline_apply_to_control:
+            contact_force = max(0.0, snapshot["meas_force_f_N"] - self.force_baseline_N)
+        else:
+            contact_force = snapshot["meas_force_f_N"]
+
+        if self.prev_contact_force_N is None or self.prev_contact_force_time_s is None:
+            d_force = 0.0
+        else:
+            dt = max(1e-6, now_s - self.prev_contact_force_time_s)
+            d_force = (contact_force - self.prev_contact_force_N) / dt
+
+        self.meas_force_contact_N = contact_force
+        self.d_contact_force_N_per_s = d_force
+        self.prev_contact_force_N = contact_force
+        self.prev_contact_force_time_s = now_s
+
+    def _control_measured_force_N(self, snapshot):
+        if self.contact_pipeline_enable and self.force_baseline_apply_to_control:
+            return self.meas_force_contact_N
+        return snapshot["meas_force_f_N"]
+
+    def _rate_limit_target(self, target_N, dt):
+        if self.prev_target_ctrl_N is None:
+            self.prev_target_ctrl_N = target_N
+            return target_N
+
+        if target_N >= self.prev_target_ctrl_N:
+            max_delta = self.target_rise_rate_N_per_s * dt
+            limited = min(target_N, self.prev_target_ctrl_N + max_delta)
+        else:
+            max_delta = self.target_fall_rate_N_per_s * dt
+            limited = max(target_N, self.prev_target_ctrl_N - max_delta)
+
+        self.prev_target_ctrl_N = limited
+        return limited
+
+    def _open_target_width(self):
+        target = clamp(self.start_width_mm, self.min_width_mm, self.max_width_mm)
+        if self.open_limit_protect_enable and self.open_limit_margin_mm > 0.0:
+            protected_max = max(self.min_width_mm, self.max_width_mm - self.open_limit_margin_mm)
+            target = min(target, protected_max)
+        self.open_target_width_mm = target
+        return target
+
+    def _open_reached(self, snapshot):
+        if not snapshot["width_valid"]:
+            return False
+        target = self._open_target_width()
+        return snapshot["width_mm"] >= target - self.open_width_tol_mm
 
     def _enter_approach(self, now_s, snapshot):
         self._set_state("APPROACH")
@@ -653,15 +801,59 @@ class WSG50FSM(object):
         self._reset_pid_dynamic_state()
         self.target_trend_detector.reset()
         self.contact_lost_timer.reset()
+        self.contact_enter_timer.reset()
         self.target_low_timer.reset()
         self.measured_low_timer.reset()
         self.release_intent_latched = False
         self.release_intent_until_s = 0.0
         self.release_open_triggered = False
+        self.force_blend_from_preload = False
+        self.preload_ready = False
+        self.initial_overshoot = False
+        if self.force_baseline_auto_enable and self.force_baseline_freeze_on_approach:
+            self.force_baseline_frozen = True
         self._reset_send_cache()
         rospy.loginfo("Enter APPROACH. init pos_cmd=%.2f mm", self.pos_cmd)
 
-    def _enter_force(self, now_s, snapshot):
+    def _enter_contact_capture(self, now_s, snapshot):
+        self._set_state("CONTACT_CAPTURE")
+        self.contact_capture_enter_time_s = now_s
+        self.capture_start_width_mm = snapshot["width_mm"] if snapshot.get("width_valid") else self.pos_cmd
+        self.capture_start_force_N = self.meas_force_contact_N
+        self._reset_pid_dynamic_state()
+        self.contact_enter_timer.reset()
+        self.preload_ready_timer.reset()
+        self.overshoot_recovered_timer.reset()
+        self.initial_overshoot = False
+        if self.capture_start_width_mm is not None:
+            self.pos_cmd = clamp(self.capture_start_width_mm, self.min_width_mm, self.max_width_mm)
+        self._reset_send_cache()
+        rospy.loginfo(
+            "Enter CONTACT_CAPTURE. width=%.2f force=%.3f baseline=%.3f",
+            self.pos_cmd if self.pos_cmd is not None else float("nan"),
+            self.capture_start_force_N,
+            self.force_baseline_N,
+        )
+
+    def _enter_overshoot_recovery(self, now_s, snapshot):
+        self._set_state("OVERSHOOT_RECOVERY")
+        self.overshoot_enter_time_s = now_s
+        self.initial_overshoot = True
+        self._reset_pid_dynamic_state()
+        self.overshoot_recovered_timer.reset()
+        self._reset_send_cache()
+        rospy.loginfo("Enter OVERSHOOT_RECOVERY. contact_force=%.3f", self.meas_force_contact_N)
+
+    def _enter_preload(self, now_s, snapshot):
+        self._set_state("PRELOAD")
+        self.preload_enter_time_s = now_s
+        self.preload_ready = False
+        self._reset_pid_dynamic_state()
+        self.preload_ready_timer.reset()
+        self._reset_send_cache()
+        rospy.loginfo("Enter PRELOAD. target=%.3f N", self.preload_target_N)
+
+    def _enter_force(self, now_s, snapshot, blend_from_preload=False):
         self._set_state("FORCE")
         self.force_enter_time_s = now_s
         self._reset_pid_dynamic_state()
@@ -674,11 +866,14 @@ class WSG50FSM(object):
         self.release_intent_until_s = 0.0
         self.release_open_triggered = False
         self.contact_lost_open_triggered = False
+        self.force_blend_from_preload = bool(blend_from_preload)
+        self.policy_blend_beta = 0.0 if self.force_blend_from_preload else 1.0
+        self.target_ctrl_after_blend_N = None
         self._t_force_start = rospy.Time.now()
         self._force_log = []
         self._rise_time_s = None
         self._settle_time_s = None
-        rospy.loginfo("Enter FORCE.")
+        rospy.loginfo("Enter FORCE. blend_from_preload=%s", self.force_blend_from_preload)
 
     def _enter_open_to_start(self, now_s, reason, snapshot, trend_metrics=None):
         self._set_state("OPEN_TO_START")
@@ -686,6 +881,7 @@ class WSG50FSM(object):
         self.open_enter_time_s = now_s
         self.open_failed = False
         self.opened_enough = False
+        self.open_target_width_mm = self._open_target_width()
         self.release_trigger_time_s = now_s
         self.release_trigger_metrics = dict(trend_metrics or {})
         self._reset_pid_dynamic_state()
@@ -701,8 +897,12 @@ class WSG50FSM(object):
         self.release_intent_until_s = 0.0
         self.target_trend_detector.reset()
         self.contact_lost_timer.reset()
+        self.contact_enter_timer.reset()
         self.target_low_timer.reset()
         self.measured_low_timer.reset()
+        self.preload_ready_timer.reset()
+        self.overshoot_recovered_timer.reset()
+        self.force_baseline_frozen = False
         self.last_hold_open_send_s = 0.0
         self._reset_send_cache()
         rospy.loginfo("Enter WAIT_REAPPROACH. Press 's' + Enter to APPROACH.")
@@ -764,6 +964,8 @@ class WSG50FSM(object):
             f"target_age={snapshot['target_age_s']:.3f} target_valid={snapshot['target_valid']} "
             f"meas_raw_signed={snapshot['meas_raw_signed_N'] if snapshot['meas_raw_signed_N'] is not None else 'nan'} "
             f"meas_f={snapshot['meas_force_f_N'] if snapshot['meas_force_f_N'] is not None else 'nan'} "
+            f"force_baseline={self.force_baseline_N:.3f} contact_force={self.meas_force_contact_N:.3f} "
+            f"d_contact_force={self.d_contact_force_N_per_s:.3f} "
             f"meas_age={snapshot['meas_age_s']:.3f} meas_valid={snapshot['meas_valid']} "
             f"width={snapshot['width_mm'] if snapshot['width_mm'] is not None else 'nan'} "
             f"width_age={snapshot['width_age_s']:.3f} width_valid={snapshot['width_valid']} "
@@ -774,6 +976,10 @@ class WSG50FSM(object):
             f"release_intent={self.release_intent_latched} release_triggered={self.release_open_triggered} "
             f"target_low={self.target_low_confirmed} meas_low={self.measured_low_confirmed} low_force_ok={self.low_force_ok} "
             f"contact_lost_now={self.contact_lost_now} contact_lost_confirmed={self.contact_lost_confirmed} "
+            f"capture_force={self.capture_start_force_N if self.capture_start_force_N is not None else 'nan'} "
+            f"initial_overshoot={self.initial_overshoot} preload_ready={self.preload_ready} "
+            f"policy_beta={self.policy_blend_beta:.3f} target_ctrl_blend={self.target_ctrl_after_blend_N if self.target_ctrl_after_blend_N is not None else 'nan'} "
+            f"open_target={self.open_target_width_mm:.2f} "
             f"ignored_s_count={self.ignored_s_count}"
         )
         self.pub_debug.publish(String(data=data))
@@ -785,6 +991,8 @@ class WSG50FSM(object):
         now = rospy.Time.now()
         now_s = now.to_sec()
         snapshot = self._make_snapshot(now_s)
+        self._update_force_baseline(now_s, snapshot)
+        self._update_contact_measurement(now_s, snapshot)
 
         requested = self._take_reapproach_request()
         if requested:
@@ -824,8 +1032,131 @@ class WSG50FSM(object):
             self.pos_cmd = clamp(self.pos_cmd - step, self.min_width_mm, self.max_width_mm)
             self._send_goal(self.pos_cmd, self.approach_speed_mm_s)
 
-            if snapshot["meas_force_f_N"] is not None and snapshot["meas_force_f_N"] >= self.force_threshold_N:
-                self._enter_force(now_s, snapshot)
+            if self.contact_pipeline_enable:
+                contact_now = self.meas_force_contact_N >= self.force_threshold_N
+                contact_confirmed = self.contact_enter_timer.update(
+                    contact_now, now_s, self.force_enter_confirm_s)
+                if contact_confirmed:
+                    self._enter_contact_capture(now_s, snapshot)
+                    self._publish_debug(now_s, snapshot)
+                    return
+            else:
+                if snapshot["meas_force_f_N"] is not None and snapshot["meas_force_f_N"] >= self.force_threshold_N:
+                    self._enter_force(now_s, snapshot)
+                    self._publish_debug(now_s, snapshot)
+                    return
+
+        elif self.state == "CONTACT_CAPTURE":
+            if not (snapshot["width_valid"] and snapshot["meas_valid"]):
+                self._enter_open_to_start(now_s, reason="capture_stale", snapshot=snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            base_width = self.capture_start_width_mm
+            if base_width is None:
+                base_width = snapshot["width_mm"]
+            if self.capture_backoff_enable:
+                cmd_width = base_width + self.capture_backoff_mm
+                self._send_goal(cmd_width, self.capture_backoff_speed_mm_s)
+            else:
+                cmd_width = base_width
+                self._send_goal(cmd_width, self.capture_hold_speed_mm_s)
+
+            elapsed = now_s - self.contact_capture_enter_time_s if self.contact_capture_enter_time_s else 0.0
+            if elapsed >= self.capture_timeout_s:
+                self._enter_open_to_start(now_s, reason="capture_timeout", snapshot=snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            if elapsed < self.capture_settle_s:
+                self._publish_debug(now_s, snapshot)
+                return
+
+            initial_window = elapsed <= self.capture_overshoot_check_s
+            overshoot_now = (
+                self.overshoot_recovery_enable and
+                initial_window and
+                self.meas_force_contact_N >= self.capture_normal_high_N
+            )
+            if overshoot_now:
+                self._enter_overshoot_recovery(now_s, snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            self._enter_preload(now_s, snapshot)
+            self._publish_debug(now_s, snapshot)
+            return
+
+        elif self.state == "OVERSHOOT_RECOVERY":
+            if not (snapshot["width_valid"] and snapshot["meas_valid"]):
+                self._enter_open_to_start(now_s, reason="overshoot_stale", snapshot=snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            err_N = self.meas_force_contact_N - self.preload_target_N
+            if err_N > 0.0:
+                open_step_mm = clamp(
+                    self.overshoot_k_open_mm_per_N * err_N,
+                    self.overshoot_min_step_mm,
+                    self.overshoot_max_step_mm,
+                )
+            else:
+                open_step_mm = 0.0
+            cmd_width = snapshot["width_mm"] + open_step_mm
+            self._send_goal(cmd_width, self.overshoot_open_speed_mm_s)
+
+            recovered_now = (
+                self.meas_force_contact_N <= self.preload_high_N and
+                abs(self.d_contact_force_N_per_s) <= self.preload_dforce_max_N_per_s
+            )
+            recovered = self.overshoot_recovered_timer.update(
+                recovered_now, now_s, self.overshoot_recovered_confirm_s)
+            if recovered:
+                self._enter_preload(now_s, snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            elapsed = now_s - self.overshoot_enter_time_s if self.overshoot_enter_time_s else 0.0
+            if elapsed >= self.overshoot_timeout_s:
+                self._enter_open_to_start(now_s, reason="overshoot_recovery_timeout", snapshot=snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+        elif self.state == "PRELOAD":
+            if not (snapshot["width_valid"] and snapshot["meas_valid"]):
+                self._reset_pid_dynamic_state()
+                self._enter_open_to_start(now_s, reason="preload_stale", snapshot=snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            err = self.preload_target_N - self.meas_force_contact_N
+            d_term = 0.0 if self.prev_err is None else \
+                self.preload_kd_mm_per_Ns * (err - self.prev_err) / max(dt, 1e-6)
+            self.prev_err = err
+            delta_mm = self.preload_kp_mm_per_N * err + d_term
+            new_width = clamp(snapshot["width_mm"] - delta_mm, self.min_width_mm, self.max_width_mm)
+            self._send_goal(new_width, self.preload_speed_mm_s)
+
+            policy_target_valid = (
+                snapshot["target_abs_raw_N"] is not None and
+                snapshot["target_age_s"] <= self.policy_target_stale_s
+            )
+            elapsed = now_s - self.preload_enter_time_s if self.preload_enter_time_s else 0.0
+            ready_now = (
+                elapsed >= self.preload_min_hold_s and
+                self.preload_low_N <= self.meas_force_contact_N <= self.preload_high_N and
+                abs(self.d_contact_force_N_per_s) <= self.preload_dforce_max_N_per_s and
+                policy_target_valid
+            )
+            self.preload_ready = self.preload_ready_timer.update(
+                ready_now, now_s, self.preload_ready_confirm_s)
+            if self.preload_ready:
+                self._enter_force(now_s, snapshot, blend_from_preload=True)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            if elapsed >= self.preload_timeout_s:
+                self._enter_open_to_start(now_s, reason="preload_timeout", snapshot=snapshot)
                 self._publish_debug(now_s, snapshot)
                 return
 
@@ -907,7 +1238,8 @@ class WSG50FSM(object):
                     (now_s - self.force_enter_time_s) < self.force_contact_lost_grace_s
                 )
                 if not self.contact_lost_in_grace:
-                    self.contact_lost_now = snapshot["meas_force_f_N"] < self.force_contact_lost_threshold_N
+                    lost_check_force_N = self._control_measured_force_N(snapshot)
+                    self.contact_lost_now = lost_check_force_N < self.force_contact_lost_threshold_N
                     self.contact_lost_confirmed = self.contact_lost_timer.update(
                         self.contact_lost_now,
                         now_s,
@@ -941,9 +1273,31 @@ class WSG50FSM(object):
             # 控制用目标力：回调中已 abs + 滤波；这里做缩放与死区
             raw_target = snapshot["target_abs_raw_N"] if snapshot["target_abs_raw_N"] is not None else float("nan")
             scaled_target = self.target_scale * snapshot["target_force_f_N"]
-            tgt = 0.0 if abs(scaled_target) <= self.target_deadband_N else scaled_target
+            network_tgt = 0.0 if abs(scaled_target) <= self.target_deadband_N else scaled_target
+            if self.contact_pipeline_enable:
+                if self.force_blend_from_preload:
+                    self.policy_blend_beta = clamp(
+                        (now_s - self.force_enter_time_s) / max(self.policy_blend_s, 1e-6),
+                        0.0,
+                        1.0,
+                    )
+                    target_before_rate = (
+                        (1.0 - self.policy_blend_beta) * self.preload_target_N +
+                        self.policy_blend_beta * network_tgt
+                    )
+                else:
+                    self.policy_blend_beta = 1.0
+                    target_before_rate = network_tgt
+                tgt = self._rate_limit_target(target_before_rate, dt)
+                self.target_ctrl_after_blend_N = tgt
+            else:
+                self.policy_blend_beta = 1.0
+                tgt = network_tgt
+                self.target_ctrl_after_blend_N = tgt
+
+            meas_for_control = self._control_measured_force_N(snapshot)
             # PID（误差: 缩放后目标力 - 实测力）
-            err = tgt - snapshot["meas_force_f_N"]
+            err = tgt - meas_for_control
 
             # 积分启用门限 & 反风up限幅（以位移单位限制积分项）
             if abs(err) <= self.i_enable_band_N:
@@ -959,7 +1313,7 @@ class WSG50FSM(object):
             delta_mm = self.kp*err + i_term + d_term
             new_width = clamp(snapshot["width_mm"] - delta_mm, self.min_width_mm, self.max_width_mm)
             print("FORCE CTRL: target_raw=%.3f N, target_ctrl=%.3f N, meas=%.3f N, err=%.3f N ,new_width=%.2f mm"
-                  % (raw_target, tgt, snapshot["meas_force_f_N"], err, new_width))
+                  % (raw_target, tgt, meas_for_control, err, new_width))
             self._send_goal(new_width, self.pid_speed_mm_s)
 
             # ---- 新增：FORCE 期间记录（相对 FORCE 起点时间）----
@@ -972,22 +1326,20 @@ class WSG50FSM(object):
                     "target_filtered_N": snapshot["target_force_f_N"] if snapshot["target_force_f_N"] is not None else float("nan"),
                     "target_ctrl_N": float(tgt),
                     "measured_raw_N": snapshot["meas_scaled_nonneg_N"] if snapshot["meas_scaled_nonneg_N"] is not None else float("nan"),
-                    "measured_filtered_N": float(snapshot["meas_force_f_N"]),
+                    "measured_filtered_N": float(meas_for_control),
                     "error_N": float(err),
                     "width_mm": snapshot["width_mm"] if snapshot["width_mm"] is not None else float("nan"),
                     "cmd_width_mm": float(new_width),
                 })
 
         elif self.state == "OPEN_TO_START":
+            open_target = self._open_target_width()
+            self.opened_enough = self._open_reached(snapshot)
             force_resend = (now_s - self.last_open_force_send_s) >= self.open_command_force_resend_period_s
-            sent = self._send_goal(self.start_width_mm, self.open_speed_mm_s, force=force_resend)
-            if force_resend and sent:
-                self.last_open_force_send_s = now_s
-
-            self.opened_enough = (
-                snapshot["width_valid"] and
-                snapshot["width_mm"] >= self.start_width_mm - self.open_width_tol_mm
-            )
+            if not (self.open_stop_when_reached and self.opened_enough):
+                sent = self._send_goal(open_target, self.open_speed_mm_s, force=force_resend)
+                if force_resend and sent:
+                    self.last_open_force_send_s = now_s
             min_hold_done = (
                 self.open_enter_time_s is not None and
                 now_s - self.open_enter_time_s >= self.open_min_hold_s
@@ -1005,10 +1357,13 @@ class WSG50FSM(object):
                 return
 
         elif self.state == "WAIT_REAPPROACH":
+            open_target = self._open_target_width()
+            self.opened_enough = self._open_reached(snapshot)
             force_resend = (now_s - self.last_hold_open_send_s) >= self.hold_open_command_period_s
-            sent = self._send_goal(self.start_width_mm, self.hold_open_speed_mm_s, force=force_resend)
-            if force_resend and sent:
-                self.last_hold_open_send_s = now_s
+            if not (self.hold_open_stop_when_reached and self.opened_enough):
+                sent = self._send_goal(open_target, self.hold_open_speed_mm_s, force=force_resend)
+                if force_resend and sent:
+                    self.last_hold_open_send_s = now_s
 
         self._publish_debug(now_s, snapshot)
 

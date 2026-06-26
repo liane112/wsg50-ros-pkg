@@ -35,6 +35,7 @@ class WSG50FSMSimTest(object):
 
         self.start_fsm = bool(rospy.get_param("~start_fsm", True))
         self.auto_send_s = bool(rospy.get_param("~auto_send_s", True))
+        self.contact_pipeline_enable = bool(rospy.get_param("~contact_pipeline_enable", False))
         self.timeout_s = float(rospy.get_param("~timeout_s", 14.0))
         self.rate_hz = float(rospy.get_param("~rate_hz", 30.0))
 
@@ -122,6 +123,7 @@ class WSG50FSMSimTest(object):
             "_trend_min_samples:=10",
             "_trend_min_window_s:=0.35",
             "_trend_window_s:=0.60",
+            "_contact_pipeline_enable:={}".format(str(self.contact_pipeline_enable).lower()),
         ]
         self.fsm_proc = subprocess.Popen(
             args,
@@ -209,7 +211,10 @@ class WSG50FSMSimTest(object):
         self.pub_target.publish(Float32(data=self.target_force_N))
 
     def _has_required_transitions(self):
-        required = ["APPROACH", "FORCE", "OPEN_TO_START", "WAIT_REAPPROACH"]
+        if self.contact_pipeline_enable:
+            required = ["APPROACH", "CONTACT_CAPTURE", "PRELOAD", "FORCE", "OPEN_TO_START", "WAIT_REAPPROACH"]
+        else:
+            required = ["APPROACH", "FORCE", "OPEN_TO_START", "WAIT_REAPPROACH"]
         idx = 0
         for _, state, _ in self.transitions:
             if idx < len(required) and state == required[idx]:
