@@ -1,4 +1,4 @@
-# WSG50 力控状态机 v6：Dirty Contact Recovery 与 Clean Low-Force Handover
+# WSG50 力控状态机 v6.1：统一 Backoff-Reapproach 与 Clean Low-Force Handover
 
 日期：2026-07-08
 
@@ -8,16 +8,20 @@
 wsg50_fsm_force_ctrl_v6.py
 ```
 
-v6 基于 v5，但改变一个关键判断：
+v6.1 基于 v6，但把接触捕获改成一个统一原则：
 
 ```text
-过冲后回到 1N 不是恢复成功。
-只有 force、dF/dt、可选触觉/DM 代理都回到 clean low-force contact，才允许交给 policy。
+只要实测力达到 force_threshold_N=0.2N，就不直接交给预加载或推理。
+先停止接触捕获，张开 capture_backoff_mm=5mm，
+再以 dirty_reapproach_speed_mm_s=1.0mm/s 重新接近。
 ```
+
+重新接近检测到接触后，控制器把实测力维持在 0.5-1.0N。
+只有这个 clean low-force 条件和位置稳定条件连续成立 3s，才允许开启推理。
 
 ---
 
-## 1. v6 相对 v5 的核心变化
+## 1. v6.1 相对 v6 的核心变化
 
 v5 的链路是：
 
@@ -39,7 +43,7 @@ v5 的风险在于：
   -> 输出更高目标力
 ```
 
-v6 改成：
+旧 v6 的主链路是：
 
 ```text
 APPROACH
@@ -48,34 +52,39 @@ APPROACH
   -> CLEAN_LOW_FORCE_HOLD
   -> WAIT_POLICY_TARGET
   -> FORCE
+```
 
-任何接触获取/预加载/交接早期 dirty:
+v6.1 改成：
+
+```text
+APPROACH
+  -> CONTACT_CAPTURE
+  -> DIRTY_REAPPROACH
+  -> PRELOAD(0.75N target, valid band 0.5-1.0N)
+  -> CLEAN_LOW_FORCE_HOLD(0.5-1.0N continuous 3s + position stable)
+  -> WAIT_POLICY_TARGET(policy_enable=True)
+  -> FORCE
+
+任何预加载/交接早期 dirty:
   -> DIRTY_RECOVERY
   -> DIRTY_REAPPROACH
-  -> PRELOAD(low-force)
+  -> PRELOAD
   -> CLEAN_LOW_FORCE_HOLD
   -> WAIT_POLICY_TARGET
   -> FORCE
 ```
 
-2026-07-08 的 v6.1 改动：dirty/过冲后不再直接退回人工重接近，而是先停住、张开 `dirty_recovery_open_mm=10mm`，再用 `dirty_reapproach_speed_mm_s=2mm/s` 慢速二次接近。二次接近检测到接触后立即停止并进入预加载。
-
-预加载目标按 act 自动选择：
+本版默认不再按 act1/act2 给不同预加载目标，统一使用：
 
 ```text
-target_force_topic=/znsv6_cmd/act1 -> preload_target_N=1.0
-target_force_topic=/znsv6_cmd/act2 -> preload_target_N=1.5
+preload_target_N = 0.75
+preload_low_N    = 0.5
+preload_high_N   = 1.0
+clean_force_low_N  = 0.5
+clean_force_high_N = 1.0
 ```
 
-如果 topic 被重映射导致无法自动判断，可以显式设置：
-
-```bash
-_preload_act_name:=act1
-# 或
-_preload_act_name:=act2
-```
-
-显式设置 `_preload_target_N:=...` 时会覆盖自动目标。
+如果显式设置 `_preload_target_N:=...`、`_preload_low_N:=...`、`_preload_high_N:=...`，会覆盖默认值。
 
 ---
 
@@ -103,26 +112,22 @@ INIT / WAIT_REAPPROACH
 APPROACH
   -- contact confirmed -->
 CONTACT_CAPTURE
-  -- dirty/overshoot -->
-DIRTY_RECOVERY
-  -- open 10mm + release/settle -->
+  -- backoff 5mm at 10mm/s -->
 DIRTY_REAPPROACH
-  -- slow contact confirmed -->
+  -- reapproach 1mm/s + contact confirmed -->
 PRELOAD
-
-CONTACT_CAPTURE
-  -- no dirty -->
-PRELOAD
-  -- stable low-force -->
+  -- enter 0.5-1.0N band -->
 CLEAN_LOW_FORCE_HOLD
-  -- clean history + position stable -->
+  -- clean 0.5-1.0N + position stable continuous 3s -->
 WAIT_POLICY_TARGET
-  -- continuous policy target for 1s after enable -->
+  -- policy target fresh for 1s after enable -->
 FORCE
 
 PRELOAD / CLEAN_LOW_FORCE_HOLD / WAIT_POLICY_TARGET / early FORCE
   -- dirty contact -->
 DIRTY_RECOVERY
+  -- open 5mm + release/settle -->
+DIRTY_REAPPROACH
 ```
 
 补充 Mermaid 状态图：
@@ -138,10 +143,9 @@ stateDiagram-v2
     APPROACH --> CONTACT_CAPTURE: pipeline on + contact confirmed
 
     CONTACT_CAPTURE --> OPEN_TO_START: capture_stale / capture_timeout
-    CONTACT_CAPTURE --> DIRTY_RECOVERY: dirty_contact / initial overshoot
-    CONTACT_CAPTURE --> PRELOAD: settle done + clean contact
+    CONTACT_CAPTURE --> DIRTY_REAPPROACH: backoff 5mm reached
 
-    DIRTY_RECOVERY --> DIRTY_REAPPROACH: opened 10mm + released + dirty_reacquire_enable
+    DIRTY_RECOVERY --> DIRTY_REAPPROACH: opened 5mm + released + dirty_reacquire_enable
     DIRTY_RECOVERY --> OPEN_TO_START: released + no reacquire
     DIRTY_RECOVERY --> OPEN_TO_START: dirty_stale / dirty_recovery_timeout
 
@@ -156,12 +160,12 @@ stateDiagram-v2
 
     CLEAN_LOW_FORCE_HOLD --> DIRTY_RECOVERY: dirty_contact
     CLEAN_LOW_FORCE_HOLD --> OPEN_TO_START: clean_hold_stale / clean_hold_timeout
-    CLEAN_LOW_FORCE_HOLD --> WAIT_POLICY_TARGET: clean_hold_ready + position stable + wait policy
+    CLEAN_LOW_FORCE_HOLD --> WAIT_POLICY_TARGET: clean low-force continuous 3s + wait policy
     CLEAN_LOW_FORCE_HOLD --> FORCE: clean_hold_ready + no policy wait
 
     WAIT_POLICY_TARGET --> DIRTY_RECOVERY: dirty_contact
     WAIT_POLICY_TARGET --> OPEN_TO_START: policy_wait_stale / policy_wait_timeout
-    WAIT_POLICY_TARGET --> FORCE: continuous policy target ready for 1s
+    WAIT_POLICY_TARGET --> FORCE: fresh post-enable policy target for 1s
 
     FORCE --> DIRTY_RECOVERY: early dirty_contact
     FORCE --> OPEN_TO_START: target falling release
@@ -210,27 +214,26 @@ status_stale_timeout_s = 0.50
 | `WAIT_REAPPROACH -> APPROACH` | 键盘输入 `s` | 目标力低只 warning，不阻止重新接近 |
 | 其他状态按 `s` | 任意非 `INIT/WAIT_REAPPROACH` 状态 | 不切状态，只增加 `ignored_s_count` |
 | `APPROACH -> FORCE` | `contact_pipeline_enable=false` 且 `meas_force_f_N >= force_threshold_N` | 旧路径：接触后直接进入 FORCE |
-| `APPROACH -> CONTACT_CAPTURE` | `contact_pipeline_enable=true` 且 `meas_force_contact_N >= force_threshold_N` 持续 `force_enter_confirm_s` | v4/v5/v6 接触管线入口 |
-| `CONTACT_CAPTURE -> OPEN_TO_START` | `capture_timeout_s` 到期 | reason=`capture_timeout` |
-| `CONTACT_CAPTURE -> DIRTY_RECOVERY` | `dirty_now=true` 或初始过冲 | 初始过冲条件：`elapsed <= capture_overshoot_check_s` 且 `meas_force_contact_N >= capture_normal_high_N` |
-| `CONTACT_CAPTURE -> PRELOAD` | 已过 `capture_settle_s`，未 stale，未 timeout，未 dirty/overshoot | 进入低力预加载 |
-| `DIRTY_RECOVERY -> DIRTY_REAPPROACH` | 张开到 `dirty_recovery_start_width_mm + dirty_recovery_open_mm`，且 release confirmed，且 `dirty_reacquire_enable=true` | 默认路径；v6.1 默认张开 10mm 后慢速二次接近 |
+| `APPROACH -> CONTACT_CAPTURE` | `contact_pipeline_enable=true` 且 `meas_force_contact_N >= force_threshold_N` 持续 `force_enter_confirm_s` | v6.1 默认 `force_threshold_N=0.2` |
+| `CONTACT_CAPTURE -> OPEN_TO_START` | `capture_timeout_s` 到期 | 默认 `capture_timeout_s=2.0`，reason=`capture_timeout` |
+| `CONTACT_CAPTURE -> DIRTY_REAPPROACH` | 已过 `capture_settle_s`，且 `width_mm >= capture_start_width_mm + capture_backoff_mm - dirty_recovery_width_tol_mm` | 默认先以 `capture_backoff_speed_mm_s=10.0mm/s` 张开 `capture_backoff_mm=5mm`；此处不再允许直接进 `PRELOAD` |
+| `DIRTY_RECOVERY -> DIRTY_REAPPROACH` | 张开到 `dirty_recovery_start_width_mm + dirty_recovery_open_mm`，且 release confirmed，且 `dirty_reacquire_enable=true` | 默认 dirty 后也张开 `dirty_recovery_open_mm=5mm`，再慢速二次接近 |
 | `DIRTY_RECOVERY -> OPEN_TO_START` | release confirmed 且 `dirty_reacquire_enable=false` | 兼容旧安全路径，reason=`dirty_released_wait_reapproach` |
 | `DIRTY_RECOVERY -> OPEN_TO_START` | `dirty_recovery_timeout_s` 到期 | reason=`dirty_recovery_timeout` |
-| `DIRTY_REAPPROACH -> PRELOAD` | `meas_force_contact_N >= force_threshold_N` 持续 `dirty_reapproach_contact_confirm_s` | 检测到接触即停止当前位置，再进入预加载 |
+| `DIRTY_REAPPROACH -> PRELOAD` | `meas_force_contact_N >= force_threshold_N` 持续 `dirty_reapproach_contact_confirm_s` | 默认以 `dirty_reapproach_speed_mm_s=1.0mm/s` 闭合；检测到接触即停止当前位置，再进入预加载 |
 | `DIRTY_REAPPROACH -> OPEN_TO_START` | `dirty_reapproach_timeout_s` 到期 | reason=`dirty_reapproach_timeout` |
 | `PRELOAD -> DIRTY_RECOVERY` | 预加载期间 dirty | reason 使用 dirty 判据字符串，例如 `force_high,dforce_high` |
 | `PRELOAD -> OPEN_TO_START` | `preload_timeout_s` 到期 | reason=`preload_timeout` |
-| `PRELOAD -> CLEAN_LOW_FORCE_HOLD` | `preload_ready=true` 且 `clean_hold_enable=true` | 默认 v6 路径 |
+| `PRELOAD -> CLEAN_LOW_FORCE_HOLD` | `preload_ready=true` 且 `clean_hold_enable=true` | 默认目标 `preload_target_N=0.75`，合格区间 `0.5-1.0N` |
 | `PRELOAD -> WAIT_POLICY_TARGET` | `preload_ready=true`，`clean_hold_enable=false`，`policy_wait_after_preload_enable=true` | 兼容 v5 路径 |
 | `PRELOAD -> FORCE` | `preload_ready=true`，`clean_hold_enable=false`，`policy_wait_after_preload_enable=false` | 不等 policy 新目标，直接进入 FORCE |
 | `CLEAN_LOW_FORCE_HOLD -> DIRTY_RECOVERY` | clean hold 期间 dirty | 不允许把脏接触交给 policy |
 | `CLEAN_LOW_FORCE_HOLD -> OPEN_TO_START` | `clean_hold_timeout_s` 到期 | reason=`clean_hold_timeout:<clean_reason>` |
-| `CLEAN_LOW_FORCE_HOLD -> WAIT_POLICY_TARGET` | `clean_hold_ready=true` 且位置稳定，且 `policy_wait_after_preload_enable=true` | enable policy 并等待 enable 后的新目标 |
+| `CLEAN_LOW_FORCE_HOLD -> WAIT_POLICY_TARGET` | `clean_hold_ready=true` 且 `policy_wait_after_preload_enable=true` | `0.5-1.0N`、dF/dt 稳定、触觉/DM clean、位置稳定必须连续成立 `clean_hold_ready_confirm_s=3.0s`；随后 enable policy |
 | `CLEAN_LOW_FORCE_HOLD -> FORCE` | `clean_hold_ready=true` 且 `policy_wait_after_preload_enable=false` | 直接用 blend/rate limit 接管 |
 | `WAIT_POLICY_TARGET -> DIRTY_RECOVERY` | 等 policy 期间 dirty | policy 还没交接就回收 |
 | `WAIT_POLICY_TARGET -> OPEN_TO_START` | `policy_wait_timeout_s` 到期 | reason=`policy_wait_timeout` |
-| `WAIT_POLICY_TARGET -> FORCE` | `policy_target_ready=true` 持续 `policy_ready_confirm_s` | v6.1 默认 `policy_ready_confirm_s=1.0`，也就是连续收到 1s 推理 topic 后进入 FORCE |
+| `WAIT_POLICY_TARGET -> FORCE` | `policy_target_ready=true` 持续 `policy_ready_confirm_s` | v6.1 默认 `policy_ready_confirm_s=1.0`，也就是 enable 后连续收到 1s 新鲜推理 topic 后进入 FORCE |
 | `FORCE -> DIRTY_RECOVERY` | 进入 FORCE 后前 `force_dirty_monitor_s` 内 dirty | reason 前缀为 `force_handover:` |
 | `FORCE -> OPEN_TO_START` | 目标力下降释放触发 | reason 取决于 `release_gate_mode` |
 | `FORCE -> OPEN_TO_START` | 失接触确认 | reason=`contact_lost` |
@@ -244,6 +247,11 @@ preload_low_N <= meas_force_contact_N <= preload_high_N
 abs(d_contact_force_N_per_s) <= preload_dforce_max_N_per_s
 policy_gate_ok = policy_wait_after_preload_enable 或 policy target fresh
 以上条件持续 preload_ready_confirm_s
+
+v6.1 默认：
+  preload_target_N = 0.75
+  preload_low_N = 0.5
+  preload_high_N = 1.0
 ```
 
 `clean_hold_ready` 的条件：
@@ -256,6 +264,12 @@ abs(d_contact_force_N_per_s) <= clean_dforce_max_N_per_s
 启用的 tactile/DM clean 检查全部通过
 position_stable_now = true
 以上条件持续 clean_hold_ready_confirm_s
+
+v6.1 默认：
+  clean_hold_min_s = 0.0
+  clean_hold_ready_confirm_s = 3.0
+  clean_force_low_N = 0.5
+  clean_force_high_N = 1.0
 ```
 
 `position_stable_now` 的默认条件：
@@ -289,7 +303,44 @@ policy_ready_confirm_s = 1.0
 
 这表示不是收到第一帧推理 target 就进入 FORCE，而是 policy enable 之后，目标 topic 必须连续保持 fresh 约 1s。若 topic 中断超过 `policy_target_stale_s`，确认计时会清零。
 
-### 2.3 FORCE 中张开触发
+### 2.3 推理启动方式
+
+控制器会自动控制推理开始信号，不需要人工看到某个状态后再手动启动推理脚本。
+
+具体做法：
+
+```text
+CLEAN_LOW_FORCE_HOLD ready
+  -> 进入 WAIT_POLICY_TARGET
+  -> 发布 policy_enable=True
+  -> 清空旧 target 滤波
+  -> 等待 enable 之后的新推理 target 连续 fresh 1s
+  -> 进入 FORCE
+```
+
+默认 enable topic：
+
+```text
+/wsg50_fsm_force_ctrl/policy_enable
+```
+
+前提是推理脚本已经在运行，并且订阅这个 `Bool` topic：
+
+```text
+policy_enable=False 时：不发布 action，或发布但控制器不接管
+policy_enable=True  时：开始发布 /znsv6_cmd/act1 或 /znsv6_cmd/act2
+```
+
+如果现有推理脚本没有订阅 `policy_enable`，控制器不能自动启动外部推理进程。这种情况下有两个选择：
+
+```text
+推荐：给推理脚本加 policy_enable 订阅，让它收到 True 后开始发布 action。
+临时：人工提前启动推理脚本，但控制器仍会等 enable 后的新 target 连续 fresh 1s 才进 FORCE。
+```
+
+注意：当前 `policy_target_ready` 判定的是“enable 后有新鲜 target 连续到达”，不是 action 数值方差足够小。如果要定义“action 数值稳定”，需要额外增加 target 滑窗，例如 1s 内最大最小差小于某个阈值。
+
+### 2.4 FORCE 中张开触发
 
 FORCE 状态下先检查 early dirty，再检查目标力下降释放，再检查失接触，最后才运行 PID。
 
@@ -350,7 +401,7 @@ force_contact_lost_grace_s = 0.25
 force_contact_lost_confirm_s = 0.30
 ```
 
-### 2.4 张开和等待重接近
+### 2.5 张开和等待重接近
 
 `OPEN_TO_START` 持续向 `open_target_width_mm` 张开。到位判断：
 
@@ -449,8 +500,8 @@ DIRTY_RECOVERY release 后进入 DIRTY_REAPPROACH。
 v6.1 默认参数：
 
 ```text
-dirty_recovery_open_mm = 10.0
-dirty_recovery_open_speed_mm_s = 8.0
+dirty_recovery_open_mm = 5.0
+dirty_recovery_open_speed_mm_s = 10.0
 dirty_recovery_width_tol_mm = 0.3
 dirty_recovery_settle_s = 0.25
 dirty_recovery_timeout_s = 5.0
@@ -475,7 +526,7 @@ dirty_reapproach_timeout_s 到期则 OPEN_TO_START
 默认：
 
 ```text
-dirty_reapproach_speed_mm_s = 2.0
+dirty_reapproach_speed_mm_s = 1.0
 dirty_reapproach_contact_confirm_s = force_enter_confirm_s
 dirty_reapproach_timeout_s = 8.0
 ```
@@ -484,14 +535,14 @@ dirty_reapproach_timeout_s = 8.0
 
 ## 5. Clean Low-Force Handover
 
-v6.1 默认预加载目标按 act 自动选择：
+v6.1 默认预加载目标不按 act 自动变化，而是统一用低力落座目标：
 
 ```text
-/znsv6_cmd/act1 -> preload_target_N = 1.0
-/znsv6_cmd/act2 -> preload_target_N = 1.5
-preload_low_N = preload_target_N - preload_band_N
-preload_high_N = preload_target_N + preload_band_N
-preload_band_N = 0.20
+preload_target_N = 0.75
+preload_low_N = 0.5
+preload_high_N = 1.0
+preload_band_N = 0.25
+preload_speed_mm_s = 1.0
 ```
 
 PRELOAD 稳定后不会直接 enable policy，而是进入：
@@ -507,26 +558,36 @@ clean_force_low_N <= meas_force_contact_N <= clean_force_high_N
 abs(d_contact_force_N_per_s) <= clean_dforce_max_N_per_s
 没有 dirty 判据触发
 position_stable_now = true
-持续 clean_hold_min_s + clean_hold_ready_confirm_s
+以上条件持续 clean_hold_ready_confirm_s
 ```
 
 默认：
 
 ```text
-clean_hold_min_s = 0.6
-clean_hold_ready_confirm_s = 0.25
-clean_hold_timeout_s = 6.0
+clean_force_low_N = 0.5
+clean_force_high_N = 1.0
+clean_hold_min_s = 0.0
+clean_hold_ready_confirm_s = 3.0
+clean_hold_timeout_s = 10.0
+```
+
+因此不是“进入 CLEAN_LOW_FORCE_HOLD 后等 3s 就算成功”，而是：
+
+```text
+力值在 0.5-1.0N
+dF/dt 在 clean_dforce_max_N_per_s 内
+位置稳定窗口通过
+可选 tactile/DM clean 检查通过
+这些条件连续保持 3s
 ```
 
 这样做的目的不是“把力控准”，而是确保 policy 的 observation horizon 里不包含刚才的过冲/脏接触帧。
 
-上面的推荐启动命令是 act2 示例。如果跑 act1，至少改成：
+上面的推荐启动命令是 act2 示例。如果跑 act1，只需要把传感器和目标 topic 改成 act1 对应项；预加载目标默认仍然是 0.75N，不再按 act 自动变成 1N/1.5N：
 
 ```bash
 _measured_force_topic:=/znsv6_data_sensor1 \
-_target_force_topic:=/znsv6_cmd/act1 \
-_preload_act_name:=act1 \
-_dirty_hard_force_N:=1.5
+_target_force_topic:=/znsv6_cmd/act1
 ```
 
 ---
@@ -567,15 +628,16 @@ rosrun wsg_50_driver wsg50_fsm_force_ctrl_v6.py \
   _target_ctrl_topic:=/wsg50_fsm_force_ctrl/target_ctrl \
   _policy_enable_topic:=/wsg50_fsm_force_ctrl/policy_enable \
   _contact_pipeline_enable:=true \
-  _force_threshold_N:=0.15 \
+  _force_threshold_N:=0.20 \
   _capture_backoff_enable:=true \
-  _capture_backoff_mm:=0.10 \
-  _capture_backoff_speed_mm_s:=4.0 \
+  _capture_backoff_mm:=5.0 \
+  _capture_backoff_speed_mm_s:=10.0 \
+  _capture_timeout_s:=2.0 \
   _dirty_recovery_enable:=true \
-  _dirty_hard_force_N:=2.0 \
+  _dirty_hard_force_N:=1.5 \
   _dirty_dforce_limit_N_per_s:=8.0 \
-  _dirty_recovery_open_mm:=10.0 \
-  _dirty_recovery_open_speed_mm_s:=8.0 \
+  _dirty_recovery_open_mm:=5.0 \
+  _dirty_recovery_open_speed_mm_s:=10.0 \
   _dirty_recovery_width_tol_mm:=0.3 \
   _dirty_recovery_settle_s:=0.25 \
   _dirty_recovery_timeout_s:=5.0 \
@@ -583,20 +645,23 @@ rosrun wsg_50_driver wsg50_fsm_force_ctrl_v6.py \
   _dirty_release_dforce_max_N_per_s:=0.25 \
   _dirty_release_confirm_s:=0.25 \
   _dirty_reacquire_enable:=true \
-  _dirty_reapproach_speed_mm_s:=2.0 \
+  _dirty_reapproach_speed_mm_s:=1.0 \
   _dirty_reapproach_timeout_s:=8.0 \
-  _preload_act_name:=act2 \
-  _preload_band_N:=0.20 \
-  _preload_timeout_s:=20.0 \
-  _preload_min_hold_s:=0.5 \
-  _preload_ready_confirm_s:=0.5 \
-  _preload_kp_mm_per_N:=0.10 \
-  _preload_speed_mm_s:=2.0 \
-  _preload_dforce_max_N_per_s:=0.4 \
+  _preload_target_N:=0.75 \
+  _preload_low_N:=0.5 \
+  _preload_high_N:=1.0 \
+  _preload_timeout_s:=10.0 \
+  _preload_min_hold_s:=0.20 \
+  _preload_ready_confirm_s:=0.10 \
+  _preload_kp_mm_per_N:=0.05 \
+  _preload_speed_mm_s:=1.0 \
+  _preload_dforce_max_N_per_s:=1.0 \
   _clean_hold_enable:=true \
-  _clean_hold_min_s:=0.6 \
-  _clean_hold_ready_confirm_s:=0.25 \
-  _clean_hold_timeout_s:=6.0 \
+  _clean_force_low_N:=0.5 \
+  _clean_force_high_N:=1.0 \
+  _clean_hold_min_s:=0.0 \
+  _clean_hold_ready_confirm_s:=3.0 \
+  _clean_hold_timeout_s:=10.0 \
   _position_stable_enable:=true \
   _position_stable_window_s:=0.50 \
   _position_stable_max_span_mm:=0.08 \

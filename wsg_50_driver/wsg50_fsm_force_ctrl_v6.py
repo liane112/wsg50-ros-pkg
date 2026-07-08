@@ -5,7 +5,7 @@ WSG-50 有限状态机 v6（dirty contact 恢复 + clean low-force handover）
 - 输入 's' + 回车：INIT/WAIT_REAPPROACH -> APPROACH
 - APPROACH：低速按 110→0 方向闭合；若实测力 >= 阈值 -> FORCE
   或在 _contact_pipeline_enable:=true 时
-  -> CONTACT_CAPTURE -> PRELOAD -> CLEAN_LOW_FORCE_HOLD -> WAIT_POLICY_TARGET -> FORCE
+  -> CONTACT_CAPTURE -> DIRTY_REAPPROACH -> PRELOAD -> CLEAN_LOW_FORCE_HOLD -> WAIT_POLICY_TARGET -> FORCE
 - DIRTY_RECOVERY：过冲/脏接触后停止并张开一段距离
 - DIRTY_REAPPROACH：以更慢速度重新接近，检测到接触后停止并进入预加载
 - FORCE：按目标力做 PID；目标力快速下降或失接触 -> OPEN_TO_START
@@ -227,7 +227,7 @@ class WSG50FSM(object):
         # ---- 参数（仅必要的）----
         self.measured_force_index  = int(rospy.get_param("~measured_force_index", 0))
         self.target_force_index    = int(rospy.get_param("~target_force_index",   0))
-        self.force_threshold_N     = float(rospy.get_param("~force_threshold_N",  0.15))  # 单阈值，双向判定
+        self.force_threshold_N     = float(rospy.get_param("~force_threshold_N",  0.20))  # 单阈值，双向判定
 
         # 力信号预处理：缩放 + 负数归零 + 低通滤波（EMA）
         self.measured_scale         = float(rospy.get_param("~measured_scale", 1.0))
@@ -270,38 +270,36 @@ class WSG50FSM(object):
             rospy.get_param("~force_baseline_apply_to_control", True))
         self.force_enter_confirm_s = float(rospy.get_param("~force_enter_confirm_s", 0.10))
 
-        self.capture_settle_s = float(rospy.get_param("~capture_settle_s", 0.12))
+        self.capture_settle_s = float(rospy.get_param("~capture_settle_s", 0.05))
         self.capture_backoff_enable = bool(rospy.get_param("~capture_backoff_enable", True))
-        self.capture_backoff_mm = float(rospy.get_param("~capture_backoff_mm", 0.20))
-        self.capture_backoff_speed_mm_s = float(rospy.get_param("~capture_backoff_speed_mm_s", 20.0))
+        self.capture_backoff_mm = float(rospy.get_param("~capture_backoff_mm", 5.0))
+        self.capture_backoff_speed_mm_s = float(rospy.get_param("~capture_backoff_speed_mm_s", 10.0))
         self.capture_hold_speed_mm_s = float(rospy.get_param("~capture_hold_speed_mm_s", 5.0))
-        self.capture_timeout_s = float(rospy.get_param("~capture_timeout_s", 0.5))
+        self.capture_timeout_s = float(rospy.get_param("~capture_timeout_s", 2.0))
 
-        # v6.1: act1/act2 使用不同的低速预加载目标；显式设置 ~preload_target_N 时优先使用显式值。
-        self.preload_target_by_act_enable = bool(rospy.get_param("~preload_target_by_act_enable", True))
+        # v6.1: 统一接触捕获后维持 0.5-1.0 N；显式设置 ~preload_target_N 时优先使用显式值。
+        self.preload_target_by_act_enable = bool(rospy.get_param("~preload_target_by_act_enable", False))
         self.preload_act_name = str(rospy.get_param("~preload_act_name", "")).strip().lower()
-        self.preload_act1_target_N = float(rospy.get_param("~preload_act1_target_N", 1.0))
-        self.preload_act2_target_N = float(rospy.get_param("~preload_act2_target_N", 1.5))
+        self.preload_act1_target_N = float(rospy.get_param("~preload_act1_target_N", 0.75))
+        self.preload_act2_target_N = float(rospy.get_param("~preload_act2_target_N", 0.75))
         default_preload_target_N = self._default_preload_target_N()
         self.preload_target_N = float(rospy.get_param("~preload_target_N", default_preload_target_N))
-        self.preload_band_N = float(rospy.get_param("~preload_band_N", 0.20))
-        self.preload_low_N = float(rospy.get_param(
-            "~preload_low_N", max(0.0, self.preload_target_N - self.preload_band_N)))
-        self.preload_high_N = float(rospy.get_param(
-            "~preload_high_N", self.preload_target_N + self.preload_band_N))
+        self.preload_band_N = float(rospy.get_param("~preload_band_N", 0.25))
+        self.preload_low_N = float(rospy.get_param("~preload_low_N", 0.5))
+        self.preload_high_N = float(rospy.get_param("~preload_high_N", 1.0))
 
         # 兼容旧参数名：v6 中该开关只表示“初接触过冲会标记为 dirty contact”。
         self.overshoot_recovery_enable = bool(rospy.get_param("~overshoot_recovery_enable", True))
         self.capture_normal_high_N = float(rospy.get_param(
-            "~capture_normal_high_N", max(1.2, self.preload_target_N + 0.5)))
+            "~capture_normal_high_N", max(1.5, self.preload_high_N + 0.5)))
         self.capture_overshoot_check_s = float(rospy.get_param("~capture_overshoot_check_s", 0.50))
 
         self.preload_kp_mm_per_N = float(rospy.get_param("~preload_kp_mm_per_N", 0.05))
         self.preload_kd_mm_per_Ns = float(rospy.get_param("~preload_kd_mm_per_Ns", 0.0))
-        self.preload_speed_mm_s = float(rospy.get_param("~preload_speed_mm_s", 5.0))
+        self.preload_speed_mm_s = float(rospy.get_param("~preload_speed_mm_s", 1.0))
         self.preload_min_hold_s = float(rospy.get_param("~preload_min_hold_s", 0.20))
         self.preload_ready_confirm_s = float(rospy.get_param("~preload_ready_confirm_s", 0.10))
-        self.preload_timeout_s = float(rospy.get_param("~preload_timeout_s", 1.0))
+        self.preload_timeout_s = float(rospy.get_param("~preload_timeout_s", 10.0))
         self.preload_dforce_max_N_per_s = float(rospy.get_param("~preload_dforce_max_N_per_s", 1.0))
         self.policy_target_stale_s = float(rospy.get_param("~policy_target_stale_s", 0.30))
         self.policy_blend_s = float(rospy.get_param("~policy_blend_s", 0.4))
@@ -324,13 +322,13 @@ class WSG50FSM(object):
         self.policy_reset_target_filter_on_enable = bool(
             rospy.get_param("~policy_reset_target_filter_on_enable", True))
 
-        # v6.1: dirty contact 不再原地恢复。先停住，张开 10mm，再慢速二次接近。
+        # v6.1: 接触捕获/dirty contact 都重新落座。先停住，张开 5mm，再 1mm/s 二次接近。
         self.dirty_recovery_enable = bool(rospy.get_param("~dirty_recovery_enable", True))
         self.dirty_hard_force_N = float(rospy.get_param("~dirty_hard_force_N", self.capture_normal_high_N))
         self.dirty_dforce_limit_N_per_s = float(rospy.get_param("~dirty_dforce_limit_N_per_s", 8.0))
         self.dirty_recovery_stop_speed_mm_s = float(rospy.get_param("~dirty_recovery_stop_speed_mm_s", 1.0))
-        self.dirty_recovery_open_mm = float(rospy.get_param("~dirty_recovery_open_mm", 10.0))
-        self.dirty_recovery_open_speed_mm_s = float(rospy.get_param("~dirty_recovery_open_speed_mm_s", 8.0))
+        self.dirty_recovery_open_mm = float(rospy.get_param("~dirty_recovery_open_mm", 5.0))
+        self.dirty_recovery_open_speed_mm_s = float(rospy.get_param("~dirty_recovery_open_speed_mm_s", 10.0))
         self.dirty_recovery_width_tol_mm = float(rospy.get_param("~dirty_recovery_width_tol_mm", 0.3))
         self.dirty_recovery_settle_s = float(rospy.get_param("~dirty_recovery_settle_s", 0.25))
         self.dirty_recovery_timeout_s = float(rospy.get_param("~dirty_recovery_timeout_s", 5.0))
@@ -338,16 +336,16 @@ class WSG50FSM(object):
         self.dirty_release_dforce_max_N_per_s = float(rospy.get_param("~dirty_release_dforce_max_N_per_s", 0.25))
         self.dirty_release_confirm_s = float(rospy.get_param("~dirty_release_confirm_s", 0.25))
         self.dirty_reacquire_enable = bool(rospy.get_param("~dirty_reacquire_enable", True))
-        self.dirty_reapproach_speed_mm_s = float(rospy.get_param("~dirty_reapproach_speed_mm_s", 2.0))
+        self.dirty_reapproach_speed_mm_s = float(rospy.get_param("~dirty_reapproach_speed_mm_s", 1.0))
         self.dirty_reapproach_contact_confirm_s = float(
             rospy.get_param("~dirty_reapproach_contact_confirm_s", self.force_enter_confirm_s))
         self.dirty_reapproach_timeout_s = float(rospy.get_param("~dirty_reapproach_timeout_s", 8.0))
 
         # v6.1: PRELOAD 后必须积累 clean contact + 位置稳定 history，避免 observation buffer 含过冲帧。
         self.clean_hold_enable = bool(rospy.get_param("~clean_hold_enable", True))
-        self.clean_hold_min_s = float(rospy.get_param("~clean_hold_min_s", 0.6))
-        self.clean_hold_ready_confirm_s = float(rospy.get_param("~clean_hold_ready_confirm_s", 0.25))
-        self.clean_hold_timeout_s = float(rospy.get_param("~clean_hold_timeout_s", 6.0))
+        self.clean_hold_min_s = float(rospy.get_param("~clean_hold_min_s", 0.0))
+        self.clean_hold_ready_confirm_s = float(rospy.get_param("~clean_hold_ready_confirm_s", 3.0))
+        self.clean_hold_timeout_s = float(rospy.get_param("~clean_hold_timeout_s", 10.0))
         self.clean_force_low_N = float(rospy.get_param("~clean_force_low_N", self.preload_low_N))
         self.clean_force_high_N = float(rospy.get_param("~clean_force_high_N", self.preload_high_N))
         self.clean_dforce_max_N_per_s = float(
@@ -933,7 +931,7 @@ class WSG50FSM(object):
 
     def _default_preload_target_N(self):
         if not self.preload_target_by_act_enable:
-            return 0.6
+            return 0.75
         if self.preload_act_name == "act1":
             return self.preload_act1_target_N
         if self.preload_act_name == "act2":
@@ -944,7 +942,7 @@ class WSG50FSM(object):
             return self.preload_act1_target_N
         if topic_leaf == "act2":
             return self.preload_act2_target_N
-        return 0.6
+        return 0.75
 
     def _reset_position_stability(self):
         self.position_stable_samples.clear()
@@ -1306,10 +1304,11 @@ class WSG50FSM(object):
         self._publish_policy_enable(False, now_s, force=True)
         self._reset_send_cache()
         rospy.loginfo(
-            "Enter CLEAN_LOW_FORCE_HOLD. force_range=[%.3f, %.3f] min_s=%.2f",
+            "Enter CLEAN_LOW_FORCE_HOLD. force_range=[%.3f, %.3f] min_s=%.2f confirm_s=%.2f",
             self.clean_force_low_N,
             self.clean_force_high_N,
             self.clean_hold_min_s,
+            self.clean_hold_ready_confirm_s,
         )
 
     def _enter_wait_policy_target(self, now_s, snapshot):
@@ -1550,10 +1549,10 @@ class WSG50FSM(object):
             if base_width is None:
                 base_width = snapshot["width_mm"]
             if self.capture_backoff_enable:
-                cmd_width = base_width + self.capture_backoff_mm
+                cmd_width = clamp(base_width + self.capture_backoff_mm, self.min_width_mm, self.max_width_mm)
                 self._send_goal(cmd_width, self.capture_backoff_speed_mm_s)
             else:
-                cmd_width = base_width
+                cmd_width = clamp(base_width, self.min_width_mm, self.max_width_mm)
                 self._send_goal(cmd_width, self.capture_hold_speed_mm_s)
 
             elapsed = now_s - self.contact_capture_enter_time_s if self.contact_capture_enter_time_s else 0.0
@@ -1566,22 +1565,14 @@ class WSG50FSM(object):
                 self._publish_debug(now_s, snapshot)
                 return
 
-            initial_window = elapsed <= self.capture_overshoot_check_s
-            dirty_now, dirty_reason = self._dirty_contact_now(snapshot, now_s, stage="capture")
-            overshoot_now = (
-                self.overshoot_recovery_enable and
-                initial_window and
-                self.meas_force_contact_N >= self.capture_normal_high_N
+            backoff_reached = (
+                not self.capture_backoff_enable or
+                snapshot["width_mm"] >= cmd_width - self.dirty_recovery_width_tol_mm
             )
-            if dirty_now or overshoot_now:
-                reason = dirty_reason if dirty_now else "initial_overshoot"
-                self._enter_dirty_recovery(now_s, snapshot, reason=reason)
+            if backoff_reached:
+                self._enter_dirty_reapproach(now_s, snapshot)
                 self._publish_debug(now_s, snapshot)
                 return
-
-            self._enter_preload(now_s, snapshot)
-            self._publish_debug(now_s, snapshot)
-            return
 
         elif self.state == "DIRTY_RECOVERY":
             if not (snapshot["width_valid"] and snapshot["meas_valid"]):
