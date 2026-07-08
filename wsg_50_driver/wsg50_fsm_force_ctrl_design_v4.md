@@ -340,7 +340,7 @@ meas_force_contact_N <= preload_high_N
 推荐固定目标：
 
 ```text
-preload_target_N = 0.5 N
+preload_target_N = 0.7 N
 ```
 
 控制方式：
@@ -520,6 +520,198 @@ v3 主要解决 FORCE 之后的释放和重新接近。
 目标力趋势、释放和张开相关参数已经按前期采集数据做过一轮调整。
 接触捕获、过冲恢复、预加载和网络接管管线是 v4 可选管线，
 当前仍主要是脚本默认值，尚未按预加载实验数据系统调参。
+
+### 6.0 常用启动命令
+
+下面命令都以当前实际脚本 `wsg50_fsm_force_ctrl.py` 为准。
+共同约定：
+
+```text
+真实目标力输入：/znsv6_cmd/act2，第 0 通道
+真实实测力输入：/znsv6_data_sensor2，第 0 通道
+夹爪状态输入：/wsg_50_driver/status
+夹爪位置命令输出：/wsg_50_driver/goal_position
+PID 实际控制目标力输出：/wsg50_fsm_force_ctrl/target_ctrl
+debug 输出：/debug
+```
+
+1. 关闭 v4 接触/预加载管线，回到接触后直接 FORCE
+
+   使用场景：需要对照旧流程，按 `s` 后 `APPROACH -> FORCE`，
+   不经过 `CONTACT_CAPTURE / PRELOAD / OVERSHOOT_RECOVERY`。
+
+   ```bash
+   cd ~/catkin_ws
+   source devel/setup.bash
+
+   rosrun wsg_50_driver wsg50_fsm_force_ctrl.py \
+     _goal_position_topic:=/wsg_50_driver/goal_position \
+     _status_topic:=/wsg_50_driver/status \
+     _measured_force_topic:=/znsv6_data_sensor2 \
+     _measured_force_index:=0 \
+     _target_force_topic:=/znsv6_cmd/act2 \
+     _target_force_index:=0 \
+     _debug_topic:=/debug \
+     _target_ctrl_topic:=/wsg50_fsm_force_ctrl/target_ctrl \
+     _contact_pipeline_enable:=false \
+     _force_threshold_N:=0.15 \
+     _target_scale:=1.0
+   ```
+
+2. 启用 v4 管线，并启用过冲保护和慢速稳健交接
+
+   使用场景：当前推荐实验配置。接触后先 backoff，再根据过冲情况进入
+   `OVERSHOOT_RECOVERY` 或 `PRELOAD`，最后用较慢的网络目标力接管。
+
+   ```bash
+   cd ~/catkin_ws
+   source devel/setup.bash
+
+   rosrun wsg_50_driver wsg50_fsm_force_ctrl.py \
+     _goal_position_topic:=/wsg_50_driver/goal_position \
+     _status_topic:=/wsg_50_driver/status \
+     _measured_force_topic:=/znsv6_data_sensor2 \
+     _measured_force_index:=0 \
+     _target_force_topic:=/znsv6_cmd/act2 \
+     _target_force_index:=0 \
+     _debug_topic:=/debug \
+     _target_ctrl_topic:=/wsg50_fsm_force_ctrl/target_ctrl \
+     _contact_pipeline_enable:=true \
+     _force_threshold_N:=0.15 \
+     _capture_backoff_enable:=true \
+     _capture_backoff_mm:=0.10 \
+     _capture_backoff_speed_mm_s:=4.0 \
+     _overshoot_recovery_enable:=true \
+     _capture_normal_high_N:=1.8 \
+     _overshoot_timeout_s:=3.0 \
+     _overshoot_k_open_mm_per_N:=0.06 \
+     _overshoot_max_step_mm:=0.15 \
+     _overshoot_open_speed_mm_s:=6.0 \
+     _preload_target_N:=0.6 \
+     _preload_low_N:=0.52 \
+     _preload_high_N:=0.75 \
+     _preload_timeout_s:=20.0 \
+     _preload_min_hold_s:=1.0 \
+     _preload_ready_confirm_s:=2.0 \
+     _preload_kp_mm_per_N:=0.12 \
+     _preload_speed_mm_s:=3.0 \
+     _preload_dforce_max_N_per_s:=0.5 \
+     _policy_blend_s:=4.0 \
+     _target_rise_rate_N_per_s:=0.2 \
+     _target_fall_rate_N_per_s:=2.0 \
+     _target_force_lpf_alpha:=0.1 \
+     _target_scale:=1.0 \
+     _pid_speed_mm_s:=3.0 \
+     _kp_mm_per_N:=0.08 \
+     _ki_mm_per_Ns:=0.0 \
+     _kd_mm_per_Ns:=0.0 \
+     _debug_period_s:=0.05
+   ```
+
+3. 启用 v4 管线，但关闭过冲恢复
+
+   使用场景：只验证 `CONTACT_CAPTURE -> PRELOAD -> FORCE`，
+   不让状态机进入 `OVERSHOOT_RECOVERY`。仍保留接触后 backoff。
+
+   ```bash
+   cd ~/catkin_ws
+   source devel/setup.bash
+
+   rosrun wsg_50_driver wsg50_fsm_force_ctrl.py \
+     _goal_position_topic:=/wsg_50_driver/goal_position \
+     _status_topic:=/wsg_50_driver/status \
+     _measured_force_topic:=/znsv6_data_sensor2 \
+     _measured_force_index:=0 \
+     _target_force_topic:=/znsv6_cmd/act2 \
+     _target_force_index:=0 \
+     _debug_topic:=/debug \
+     _target_ctrl_topic:=/wsg50_fsm_force_ctrl/target_ctrl \
+     _contact_pipeline_enable:=true \
+     _force_threshold_N:=0.15 \
+     _capture_backoff_enable:=true \
+     _capture_backoff_mm:=0.10 \
+     _capture_backoff_speed_mm_s:=4.0 \
+     _overshoot_recovery_enable:=false \
+     _preload_target_N:=0.6 \
+     _preload_low_N:=0.52 \
+     _preload_high_N:=0.75 \
+     _preload_timeout_s:=20.0 \
+     _preload_min_hold_s:=1.0 \
+     _preload_ready_confirm_s:=2.0 \
+     _preload_kp_mm_per_N:=0.12 \
+     _preload_speed_mm_s:=3.0 \
+     _preload_dforce_max_N_per_s:=0.5 \
+     _policy_blend_s:=4.0 \
+     _target_rise_rate_N_per_s:=0.2 \
+     _target_fall_rate_N_per_s:=2.0 \
+     _target_force_lpf_alpha:=0.1 \
+     _target_scale:=1.0 \
+     _pid_speed_mm_s:=3.0 \
+     _kp_mm_per_N:=0.08 \
+     _ki_mm_per_Ns:=0.0 \
+     _kd_mm_per_Ns:=0.0 \
+     _debug_period_s:=0.05
+   ```
+
+4. 启用 v4 管线，但关闭 backoff 和过冲恢复
+
+   使用场景：只保留接触确认、预加载稳定、网络慢接管。
+   接触瞬间不主动微张开，也不做过冲恢复。
+
+   ```bash
+   cd ~/catkin_ws
+   source devel/setup.bash
+
+   rosrun wsg_50_driver wsg50_fsm_force_ctrl.py \
+     _goal_position_topic:=/wsg_50_driver/goal_position \
+     _status_topic:=/wsg_50_driver/status \
+     _measured_force_topic:=/znsv6_data_sensor2 \
+     _measured_force_index:=0 \
+     _target_force_topic:=/znsv6_cmd/act2 \
+     _target_force_index:=0 \
+     _debug_topic:=/debug \
+     _target_ctrl_topic:=/wsg50_fsm_force_ctrl/target_ctrl \
+     _contact_pipeline_enable:=true \
+     _force_threshold_N:=0.15 \
+     _capture_backoff_enable:=false \
+     _capture_hold_speed_mm_s:=3.0 \
+     _overshoot_recovery_enable:=false \
+     _preload_target_N:=0.6 \
+     _preload_low_N:=0.52 \
+     _preload_high_N:=0.75 \
+     _preload_timeout_s:=20.0 \
+     _preload_min_hold_s:=1.0 \
+     _preload_ready_confirm_s:=2.0 \
+     _preload_kp_mm_per_N:=0.12 \
+     _preload_speed_mm_s:=3.0 \
+     _preload_dforce_max_N_per_s:=0.5 \
+     _policy_blend_s:=4.0 \
+     _target_rise_rate_N_per_s:=0.2 \
+     _target_fall_rate_N_per_s:=2.0 \
+     _target_force_lpf_alpha:=0.1 \
+     _target_scale:=1.0 \
+     _pid_speed_mm_s:=3.0 \
+     _kp_mm_per_N:=0.08 \
+     _ki_mm_per_Ns:=0.0 \
+     _kd_mm_per_Ns:=0.0 \
+     _debug_period_s:=0.05
+   ```
+
+5. 配套三曲线可视化
+
+   使用场景：同时看真实目标力、真实实测力和 PID 实际控制目标力。
+
+   ```bash
+   cd ~/catkin_ws
+   source devel/setup.bash
+
+   rosrun sensor_recorder pyqtgraph_live_viewer.py \
+     _image_rotate_deg:=-90 \
+     --image-topic /cam_4/color/image_raw \
+     --target-topic /znsv6_cmd/act2 \
+     --actual-topic /znsv6_data_sensor2 \
+     --control-topic /wsg50_fsm_force_ctrl/target_ctrl
+   ```
 
 ### 6.1 v4 管线总开关
 
@@ -741,7 +933,7 @@ v3 主要解决 FORCE 之后的释放和重新接近。
 4. 过冲恢复张开步长
    - 当前代码值：`overshoot_k_open_mm_per_N = 0.10 mm/N`，
      `overshoot_min_step_mm = 0.02 mm`，`overshoot_max_step_mm = 0.20 mm`，
-     `preload_target_N = 0.5 N`。
+     `preload_target_N = 0.7 N`。
    - 实测状态：v4 管线默认值，未按预加载实验系统调整。
    - 物理意义：恢复阶段用 `meas_force_contact_N - preload_target_N`
      计算张开步长。接触力越高，每个 tick 张开越多；
@@ -755,26 +947,26 @@ v3 主要解决 FORCE 之后的释放和重新接近。
      超过 `0.8 s` 未恢复则退出到张开状态。
 
 6. 恢复确认时间
-   - 当前代码值：`preload_high_N = 0.8 N`，
+   - 当前代码值：`preload_high_N = 0.9 N`，
      `preload_dforce_max_N_per_s = 1.0 N/s`，
      `overshoot_recovered_confirm_s = 0.10 s`。
    - 实测状态：v4 管线默认值。
-   - 物理意义：恢复阶段不是直接闭环控制到 `0.5 N`。
-     当接触力降到 `0.8 N` 以下，且力变化率足够小，
+   - 物理意义：恢复阶段不是直接闭环控制到 `0.7 N`。
+     当接触力降到 `0.9 N` 以下，且力变化率足够小，
      并持续 `0.10 s` 后，才认为恢复成功并进入 PRELOAD。
 
 ### 6.8 PRELOAD
 
 1. 预加载目标力
-   - 当前代码值：`preload_target_N = 0.5 N`。
+   - 当前代码值：`preload_target_N = 0.7 N`。
    - 实测状态：v4 管线默认值，尚未按预加载采集数据调整。
-   - 物理意义：进入 FORCE 前，先把接触力拉到约 `0.5 N`。
+   - 物理意义：进入 FORCE 前，先把接触力拉到约 `0.7 N`。
 
 2. 预加载合格区间
-   - 当前代码值：`preload_low_N = 0.25 N`，
-     `preload_high_N = 0.8 N`。
+   - 当前代码值：`preload_low_N = 0.5 N`，
+     `preload_high_N = 0.9 N`。
    - 实测状态：v4 管线默认值，尚未按预加载采集数据调整。
-   - 物理意义：接触力落在 `0.25 ~ 0.8 N` 内，
+   - 物理意义：接触力落在 `0.5 ~ 0.9 N` 内，
      才可能被认为预加载合格。
 
 3. 预加载 P/D 控制
@@ -826,6 +1018,12 @@ v3 主要解决 FORCE 之后的释放和重新接近。
    - 实测状态：v4 管线默认值。
    - 物理意义：网络目标力上升更保守，下降允许更快，
      避免夹持力突然增大。
+   - 启用阶段：只在 `contact_pipeline_enable = True` 的 FORCE 状态中启用。
+     普通 v3 FORCE 路径不经过这个目标力限速。
+   - 实现方式：先算出接管/融合后的目标力 `target_before_rate`，
+     再限制它相对上一拍控制目标的最大变化量。
+     30 Hz 下默认约为上升每拍最多 `0.067 N`，
+     下降每拍最多 `0.133 N`。
 
 ### 6.10 FORCE PID 与命令去抖
 
@@ -842,9 +1040,9 @@ v3 主要解决 FORCE 之后的释放和重新接近。
      积分项最多贡献 `2.0 mm` 宽度修正。
 
 3. 目标力死区和缩放
-   - 当前代码值：`target_deadband_N = 0.1 N`，`target_scale = 1.15`。
+   - 当前代码值：`target_deadband_N = 0.1 N`，`target_scale = 1.0`。
    - 实测状态：当前实际脚本默认值。
-   - 物理意义：目标力很小时归零；控制用目标力会乘以 `1.15`。
+   - 物理意义：目标力很小时归零；当前默认不额外放大网络目标力。
 
 4. 命令去抖
    - 当前代码值：`pos_eps_mm = 0.03 mm`，
@@ -1195,9 +1393,9 @@ capture_hold_speed_mm_s = 5.0
 capture_timeout_s = 0.5
 
 # preload
-preload_target_N = 0.5
-preload_low_N = 0.25
-preload_high_N = 0.8
+preload_target_N = 0.7
+preload_low_N = 0.5
+preload_high_N = 0.9
 preload_kp_mm_per_N = 0.05
 preload_kd_mm_per_Ns = 0.0
 preload_speed_mm_s = 5.0

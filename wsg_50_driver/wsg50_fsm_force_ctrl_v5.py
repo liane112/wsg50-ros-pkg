@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WSG-50 有限状态机（默认五态；可选 v4 接触捕获/预加载管线）
+WSG-50 有限状态机 v5（1N 稳定预加载后再使能策略目标）
 - 输入 's' + 回车：INIT/WAIT_REAPPROACH -> APPROACH
 - APPROACH：低速按 110→0 方向闭合；若实测力 >= 阈值 -> FORCE
-  或在 _contact_pipeline_enable:=true 时 -> CONTACT_CAPTURE -> PRELOAD -> FORCE
+  或在 _contact_pipeline_enable:=true 时 -> CONTACT_CAPTURE -> PRELOAD -> WAIT_POLICY_TARGET -> FORCE
 - FORCE：按目标力做 PID；目标力快速下降或失接触 -> OPEN_TO_START
 - OPEN_TO_START：张开到 start_width_mm；到位或超时 -> WAIT_REAPPROACH
 - WAIT_REAPPROACH：保持张开，等待键盘 's'
 - 频率固定 30 Hz
 - 订阅/发布话题沿用之前：
   * pub  : /wsg_50_driver/goal_position (wsg_50_common/Cmd)
-  * pub  : ~/measured_force_filtered, ~/target_ctrl (std_msgs/Float32)
+  * pub  : ~/measured_force_filtered, ~/target_ctrl (std_msgs/Float32), ~/policy_enable (std_msgs/Bool)
   * sub  : /wsg_50_driver/status (wsg_50_common/Status: width[mm])  
   * sub  : /znsv6_data_sensor2      (实测力：支持 *WithHeader/Float32/Float64/MultiArray)
   * sub  : /znsv6_cmd/act2          (目标力：同上)
@@ -25,7 +25,7 @@ import rospy
 from rospy import AnyMsg
 from roslib.message import get_message_class
 from wsg_50_common.msg import Cmd, Status
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Bool
 # [MOD] 绘图依赖（无显示环境用 Agg）
 try:
     import matplotlib
@@ -270,9 +270,9 @@ class WSG50FSM(object):
         self.overshoot_timeout_s = float(rospy.get_param("~overshoot_timeout_s", 0.8))
         self.overshoot_recovered_confirm_s = float(rospy.get_param("~overshoot_recovered_confirm_s", 0.10))
 
-        self.preload_target_N = float(rospy.get_param("~preload_target_N", 0.7))
-        self.preload_low_N = float(rospy.get_param("~preload_low_N", 0.5))
-        self.preload_high_N = float(rospy.get_param("~preload_high_N", 0.9))
+        self.preload_target_N = float(rospy.get_param("~preload_target_N", 1.0))
+        self.preload_low_N = float(rospy.get_param("~preload_low_N", 0.9))
+        self.preload_high_N = float(rospy.get_param("~preload_high_N", 1.1))
         self.preload_kp_mm_per_N = float(rospy.get_param("~preload_kp_mm_per_N", 0.05))
         self.preload_kd_mm_per_Ns = float(rospy.get_param("~preload_kd_mm_per_Ns", 0.0))
         self.preload_speed_mm_s = float(rospy.get_param("~preload_speed_mm_s", 5.0))
@@ -284,6 +284,22 @@ class WSG50FSM(object):
         self.policy_blend_s = float(rospy.get_param("~policy_blend_s", 0.4))
         self.target_rise_rate_N_per_s = float(rospy.get_param("~target_rise_rate_N_per_s", 2.0))
         self.target_fall_rate_N_per_s = float(rospy.get_param("~target_fall_rate_N_per_s", 4.0))
+
+        # v5: PRELOAD 稳定后再通知策略开始推理，并等待使能后的新目标力。
+        self.policy_wait_after_preload_enable = bool(
+            rospy.get_param("~policy_wait_after_preload_enable", True))
+        self.policy_enable_topic = rospy.get_param("~policy_enable_topic", "~policy_enable")
+        self.policy_enable_latch = bool(rospy.get_param("~policy_enable_latch", True))
+        self.policy_enable_publish_period_s = float(
+            rospy.get_param("~policy_enable_publish_period_s", 0.10))
+        self.policy_wait_timeout_s = float(rospy.get_param("~policy_wait_timeout_s", 5.0))
+        self.policy_ready_confirm_s = float(rospy.get_param("~policy_ready_confirm_s", 0.10))
+        self.policy_require_target_after_enable = bool(
+            rospy.get_param("~policy_require_target_after_enable", True))
+        self.policy_target_after_enable_margin_s = float(
+            rospy.get_param("~policy_target_after_enable_margin_s", 0.0))
+        self.policy_reset_target_filter_on_enable = bool(
+            rospy.get_param("~policy_reset_target_filter_on_enable", True))
 
         # PID（单位：mm/N, mm/(N·s), mm/(N·s)）
         self.kp = float(rospy.get_param("~kp_mm_per_N",   0.15))
@@ -379,7 +395,7 @@ class WSG50FSM(object):
 
         # ---- 运行时变量 ----
         self._lock = threading.RLock()
-        self.state   = "INIT"                       # INIT / APPROACH / CONTACT_CAPTURE / OVERSHOOT_RECOVERY / PRELOAD / FORCE / OPEN_TO_START / WAIT_REAPPROACH
+        self.state   = "INIT"                       # INIT / APPROACH / CONTACT_CAPTURE / OVERSHOOT_RECOVERY / PRELOAD / WAIT_POLICY_TARGET / FORCE / OPEN_TO_START / WAIT_REAPPROACH
         self.prev_state = None
 
         self.width_mm = None
@@ -451,6 +467,7 @@ class WSG50FSM(object):
         self.contact_enter_timer = HoldTimer()
         self.preload_ready_timer = HoldTimer()
         self.overshoot_recovered_timer = HoldTimer()
+        self.policy_target_ready_timer = HoldTimer()
         self.target_low_now = False
         self.target_low_confirmed = False
         self.measured_low_now = False
@@ -484,6 +501,11 @@ class WSG50FSM(object):
         self.capture_start_force_N = None
         self.overshoot_enter_time_s = None
         self.preload_enter_time_s = None
+        self.policy_wait_enter_time_s = None
+        self.policy_enable_time_s = None
+        self.policy_target_ready = False
+        self.policy_enabled = False
+        self.last_policy_enable_send_s = 0.0
         self.initial_overshoot = False
         self.preload_ready = False
         self.policy_blend_beta = 1.0
@@ -509,6 +531,11 @@ class WSG50FSM(object):
             self.filtered_measured_force_topic, Float32, queue_size=10)
         self.pub_target_ctrl = rospy.Publisher(
             self.target_ctrl_topic, Float32, queue_size=10)
+        self.pub_policy_enable = None
+        if str(self.policy_enable_topic).strip():
+            self.pub_policy_enable = rospy.Publisher(
+                self.policy_enable_topic, Bool, queue_size=10, latch=self.policy_enable_latch)
+            self.pub_policy_enable.publish(Bool(data=False))
         self._last_debug_t = rospy.Time(0)
         rospy.Subscriber(self.status_topic,         Status,  self._status_cb,  queue_size=20)
         rospy.Subscriber(self.measured_force_topic, AnyMsg,  self._meas_cb,    queue_size=50)
@@ -598,6 +625,8 @@ class WSG50FSM(object):
     def _check_target_timeout(self):
         if self.target_timeout_s <= 0.0:
             return
+        if self.policy_wait_after_preload_enable and not self.policy_enabled and self.state != "FORCE":
+            return
         now = rospy.Time.now()
         with self._lock:
             last_target_rx_t = self.last_target_rx_t
@@ -652,6 +681,40 @@ class WSG50FSM(object):
         self.last_cmd_width_mm = w
         self.last_cmd_speed_mm_s = v
         return True
+
+    def _publish_policy_enable(self, enabled, now_s, force=False):
+        enabled = bool(enabled)
+        self.policy_enabled = enabled
+        if self.pub_policy_enable is None:
+            return
+        if not force and (now_s - self.last_policy_enable_send_s) < self.policy_enable_publish_period_s:
+            return
+        self.pub_policy_enable.publish(Bool(data=enabled))
+        self.last_policy_enable_send_s = now_s
+
+    def _update_preload_control(self, snapshot, dt):
+        err = self.preload_target_N - self.meas_force_contact_N
+        d_term = 0.0 if self.prev_err is None else \
+            self.preload_kd_mm_per_Ns * (err - self.prev_err) / max(dt, 1e-6)
+        self.prev_err = err
+        delta_mm = self.preload_kp_mm_per_N * err + d_term
+        new_width = clamp(snapshot["width_mm"] - delta_mm, self.min_width_mm, self.max_width_mm)
+        self._send_goal(new_width, self.preload_speed_mm_s)
+        self.target_ctrl_after_blend_N = self.preload_target_N
+        self.pub_target_ctrl.publish(Float32(data=float(self.preload_target_N)))
+        return new_width
+
+    def _policy_target_ready_now(self, snapshot):
+        if snapshot["target_abs_raw_N"] is None:
+            return False
+        if snapshot["target_age_s"] > self.policy_target_stale_s:
+            return False
+        if not self.policy_require_target_after_enable:
+            return True
+        if self.policy_enable_time_s is None or snapshot["target_stamp_s"] is None:
+            return False
+        return snapshot["target_stamp_s"] > (
+            self.policy_enable_time_s + self.policy_target_after_enable_margin_s)
 
     def _age_s(self, now_s, stamp_s):
         return float("inf") if stamp_s is None else max(0.0, now_s - stamp_s)
@@ -809,6 +872,7 @@ class WSG50FSM(object):
         self.initial_overshoot = False
         if self.force_baseline_auto_enable and self.force_baseline_freeze_on_approach:
             self.force_baseline_frozen = True
+        self._publish_policy_enable(False, now_s, force=True)
         self._reset_send_cache()
         rospy.loginfo("Enter APPROACH. init pos_cmd=%.2f mm", self.pos_cmd)
 
@@ -824,6 +888,7 @@ class WSG50FSM(object):
         self.initial_overshoot = False
         if self.capture_start_width_mm is not None:
             self.pos_cmd = clamp(self.capture_start_width_mm, self.min_width_mm, self.max_width_mm)
+        self._publish_policy_enable(False, now_s, force=True)
         self._reset_send_cache()
         rospy.loginfo(
             "Enter CONTACT_CAPTURE. width=%.2f force=%.3f baseline=%.3f",
@@ -838,6 +903,7 @@ class WSG50FSM(object):
         self.initial_overshoot = True
         self._reset_pid_dynamic_state()
         self.overshoot_recovered_timer.reset()
+        self._publish_policy_enable(False, now_s, force=True)
         self._reset_send_cache()
         rospy.loginfo("Enter OVERSHOOT_RECOVERY. contact_force=%.3f", self.meas_force_contact_N)
 
@@ -847,8 +913,28 @@ class WSG50FSM(object):
         self.preload_ready = False
         self._reset_pid_dynamic_state()
         self.preload_ready_timer.reset()
+        self.policy_target_ready_timer.reset()
+        self._publish_policy_enable(False, now_s, force=True)
         self._reset_send_cache()
         rospy.loginfo("Enter PRELOAD. target=%.3f N", self.preload_target_N)
+
+    def _enter_wait_policy_target(self, now_s, snapshot):
+        self._set_state("WAIT_POLICY_TARGET")
+        self.policy_wait_enter_time_s = now_s
+        self.policy_enable_time_s = now_s
+        self.policy_target_ready = False
+        self.policy_target_ready_timer.reset()
+        self._reset_pid_dynamic_state()
+        self._reset_send_cache()
+        if self.policy_reset_target_filter_on_enable:
+            with self._lock:
+                self.target_force_f = None
+                self.target_force = None
+        self._publish_policy_enable(True, now_s, force=True)
+        rospy.loginfo(
+            "Enter WAIT_POLICY_TARGET. enable policy and hold preload=%.3f N",
+            self.preload_target_N,
+        )
 
     def _enter_force(self, now_s, snapshot, blend_from_preload=False):
         self._set_state("FORCE")
@@ -870,6 +956,7 @@ class WSG50FSM(object):
         self._force_log = []
         self._rise_time_s = None
         self._settle_time_s = None
+        self._publish_policy_enable(True, now_s, force=True)
         rospy.loginfo("Enter FORCE. blend_from_preload=%s", self.force_blend_from_preload)
 
     def _enter_open_to_start(self, now_s, reason, snapshot, trend_metrics=None):
@@ -884,6 +971,7 @@ class WSG50FSM(object):
         self._reset_pid_dynamic_state()
         self.pos_cmd = None
         self.last_open_force_send_s = 0.0
+        self._publish_policy_enable(False, now_s, force=True)
         self._reset_send_cache()
         rospy.loginfo("Enter OPEN_TO_START. reason=%s", reason)
 
@@ -899,8 +987,10 @@ class WSG50FSM(object):
         self.measured_low_timer.reset()
         self.preload_ready_timer.reset()
         self.overshoot_recovered_timer.reset()
+        self.policy_target_ready_timer.reset()
         self.force_baseline_frozen = False
         self.last_hold_open_send_s = 0.0
+        self._publish_policy_enable(False, now_s, force=True)
         self._reset_send_cache()
         rospy.loginfo("Enter WAIT_REAPPROACH. Press 's' + Enter to APPROACH.")
 
@@ -975,6 +1065,9 @@ class WSG50FSM(object):
             f"contact_lost_now={self.contact_lost_now} contact_lost_confirmed={self.contact_lost_confirmed} "
             f"capture_force={self.capture_start_force_N if self.capture_start_force_N is not None else 'nan'} "
             f"initial_overshoot={self.initial_overshoot} preload_ready={self.preload_ready} "
+            f"policy_enabled={self.policy_enabled} policy_target_ready={self.policy_target_ready} "
+            f"policy_wait_elapsed={(now_s - self.policy_wait_enter_time_s) if self.policy_wait_enter_time_s is not None else 'nan'} "
+            f"policy_enable_time={self.policy_enable_time_s if self.policy_enable_time_s is not None else 'nan'} "
             f"policy_beta={self.policy_blend_beta:.3f} target_ctrl_blend={self.target_ctrl_after_blend_N if self.target_ctrl_after_blend_N is not None else 'nan'} "
             f"open_target={self.open_target_width_mm:.2f} "
             f"ignored_s_count={self.ignored_s_count}"
@@ -1126,34 +1219,56 @@ class WSG50FSM(object):
                 self._publish_debug(now_s, snapshot)
                 return
 
-            err = self.preload_target_N - self.meas_force_contact_N
-            d_term = 0.0 if self.prev_err is None else \
-                self.preload_kd_mm_per_Ns * (err - self.prev_err) / max(dt, 1e-6)
-            self.prev_err = err
-            delta_mm = self.preload_kp_mm_per_N * err + d_term
-            new_width = clamp(snapshot["width_mm"] - delta_mm, self.min_width_mm, self.max_width_mm)
-            self._send_goal(new_width, self.preload_speed_mm_s)
+            self._update_preload_control(snapshot, dt)
 
             policy_target_valid = (
                 snapshot["target_abs_raw_N"] is not None and
                 snapshot["target_age_s"] <= self.policy_target_stale_s
             )
+            policy_gate_ok = self.policy_wait_after_preload_enable or policy_target_valid
             elapsed = now_s - self.preload_enter_time_s if self.preload_enter_time_s else 0.0
             ready_now = (
                 elapsed >= self.preload_min_hold_s and
                 self.preload_low_N <= self.meas_force_contact_N <= self.preload_high_N and
                 abs(self.d_contact_force_N_per_s) <= self.preload_dforce_max_N_per_s and
-                policy_target_valid
+                policy_gate_ok
             )
             self.preload_ready = self.preload_ready_timer.update(
                 ready_now, now_s, self.preload_ready_confirm_s)
             if self.preload_ready:
-                self._enter_force(now_s, snapshot, blend_from_preload=True)
+                if self.policy_wait_after_preload_enable:
+                    self._enter_wait_policy_target(now_s, snapshot)
+                else:
+                    self._enter_force(now_s, snapshot, blend_from_preload=True)
                 self._publish_debug(now_s, snapshot)
                 return
 
             if elapsed >= self.preload_timeout_s:
                 self._enter_open_to_start(now_s, reason="preload_timeout", snapshot=snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+        elif self.state == "WAIT_POLICY_TARGET":
+            if not (snapshot["width_valid"] and snapshot["meas_valid"]):
+                self._reset_pid_dynamic_state()
+                self._enter_open_to_start(now_s, reason="policy_wait_stale", snapshot=snapshot)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            self._publish_policy_enable(True, now_s)
+            self._update_preload_control(snapshot, dt)
+
+            ready_now = self._policy_target_ready_now(snapshot)
+            self.policy_target_ready = self.policy_target_ready_timer.update(
+                ready_now, now_s, self.policy_ready_confirm_s)
+            if self.policy_target_ready:
+                self._enter_force(now_s, snapshot, blend_from_preload=True)
+                self._publish_debug(now_s, snapshot)
+                return
+
+            elapsed = now_s - self.policy_wait_enter_time_s if self.policy_wait_enter_time_s else 0.0
+            if self.policy_wait_timeout_s > 0.0 and elapsed >= self.policy_wait_timeout_s:
+                self._enter_open_to_start(now_s, reason="policy_wait_timeout", snapshot=snapshot)
                 self._publish_debug(now_s, snapshot)
                 return
 
